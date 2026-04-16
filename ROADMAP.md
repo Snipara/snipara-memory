@@ -33,6 +33,7 @@ Already available in `0.1.x`:
 - migration tooling between stores
 - namespace export and backup flows
 - richer policy hooks for compaction and archiving
+- clearer integration contract for external automation runtimes
 
 ## Not In Scope
 
@@ -43,3 +44,4 @@ These stay in the hosted Snipara product, not this repository:
 - hosted MCP transport
 - managed review queues
 - commercial analytics and operations
+- client hook installers and session-lifecycle runtimes

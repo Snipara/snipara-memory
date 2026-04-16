@@ -136,6 +136,27 @@ Not included:
 
 Those remain part of Snipara's commercial hosted product.
 
+## Relationship To Automation Runtimes
+
+`snipara-memory` is a memory engine, not a session-lifecycle runtime.
+
+It fits well behind local or hosted automation layers that want to:
+
+- capture session events
+- extract durable observations
+- store and recall memories
+- assemble session warm-up bundles
+
+It does **not** own:
+
+- IDE or client hook installation
+- cross-client event normalization
+- context injection policy for interactive sessions
+- hosted analytics, review workflows, or orchestration
+
+That boundary is intentional. The package stays useful as a standalone memory
+domain instead of turning into a full agent platform.
+
 ## Install
 
 Until the first PyPI release is published, install from GitHub:
@@ -167,6 +188,24 @@ Local store path by default:
 ```text
 ~/.snipara-memory/store.json
 ```
+
+## Publishing
+
+The repository is already wired for trusted publishing from GitHub Actions via
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml).
+
+If the publish job fails with `invalid-publisher`, the remaining setup is on the
+PyPI side, not in the package code.
+
+Required trusted publisher settings on PyPI:
+
+- owner/repository: `Snipara/snipara-memory`
+- workflow file: `.github/workflows/publish.yml`
+- branch: `main`
+- environment: `pypi`
+
+Once that publisher exists on PyPI, pushing to `main` or running the workflow
+manually will publish the package.
 
 ## Python Quickstart
 
