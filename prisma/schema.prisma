@@ -1,0 +1,251 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+enum NamespaceType {
+  AGENT
+  PROJECT
+  TEAM
+  USER
+}
+
+enum MemoryType {
+  FACT
+  DECISION
+  LEARNING
+  PREFERENCE
+  TODO
+  CONTEXT
+}
+
+enum MemoryScope {
+  AGENT
+  PROJECT
+  TEAM
+  USER
+}
+
+enum MemoryTier {
+  CRITICAL
+  DAILY
+  ARCHIVE
+}
+
+enum MemoryStatus {
+  ACTIVE
+  ARCHIVED
+  GRAVEYARD
+}
+
+enum GraveyardReason {
+  DUPLICATE
+  SUPERSEDED
+  CONTRADICTION_LOSER
+  MERGED_INTO_OTHER
+  EXPIRED
+  INVALID_REFERENCE
+  MANUAL
+}
+
+enum ContradictionStatus {
+  DETECTED
+  RESOLVED
+  IGNORED
+}
+
+enum ContradictionResolution {
+  NEWER
+  HIGHER_CONFIDENCE
+  MERGE
+  MANUAL
+}
+
+model Namespace {
+  id        String        @id @default(cuid())
+  slug      String        @unique
+  name      String
+  type      NamespaceType @default(PROJECT)
+  metadata  Json?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  memories         Memory[]
+  graveyardEntries MemoryGraveyardEntry[]
+  contradictions   MemoryContradiction[]
+  stats            MemoryStats?
+
+  @@map("namespaces")
+}
+
+model Memory {
+  id          String      @id @default(cuid())
+  namespaceId String
+  namespace   Namespace   @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+
+  content     String      @db.Text
+  contentHash String
+  title       String?
+
+  type        MemoryType  @default(FACT)
+  scope       MemoryScope @default(PROJECT)
+  category    String?
+  source      String?
+  tags        String[]
+  metadata    Json?
+
+  confidence      Float        @default(1.0)
+  relevanceBoost  Float        @default(1.0)
+  accessCount     Int          @default(0)
+  lastAccessedAt  DateTime?
+  tier            MemoryTier   @default(ARCHIVE)
+  status          MemoryStatus @default(ACTIVE)
+
+  relatedMemoryIds    String[]
+  documentRefs        String[]
+  invalidDocumentRefs String[]
+
+  expiresAt     DateTime?
+  journalDate   DateTime? @db.Date
+
+  contradictionCount Int @default(0)
+
+  supersededById String?
+  supersededBy   Memory?  @relation("MemorySupersession", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes     Memory[] @relation("MemorySupersession")
+
+  restoredFromGraveyardId String?
+  promotedAt              DateTime?
+  promotedBy              String?
+  buriedAt                DateTime?
+  buriedReason            GraveyardReason?
+
+  embedding        Unsupported("vector(1024)")?
+  embeddingModel   String?
+  embeddingVersion String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([namespaceId, status])
+  @@index([namespaceId, tier])
+  @@index([namespaceId, type])
+  @@index([namespaceId, scope])
+  @@index([namespaceId, category])
+  @@index([namespaceId, createdAt])
+  @@index([namespaceId, lastAccessedAt])
+  @@index([namespaceId, accessCount])
+  @@index([namespaceId, confidence])
+  @@index([expiresAt])
+  @@index([contentHash])
+  @@map("memories")
+}
+
+model MemoryGraveyardEntry {
+  id          String    @id @default(cuid())
+  namespaceId String
+  namespace   Namespace @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+
+  originalMemoryId String?
+  replacedById     String?
+  contradictionId  String?
+
+  content      String   @db.Text
+  contentHash  String
+  title        String?
+  type         MemoryType
+  scope        MemoryScope
+  category     String?
+  source       String?
+  tags         String[]
+  metadata     Json?
+  confidence   Float     @default(1.0)
+  previousTier MemoryTier?
+  previousStatus MemoryStatus?
+
+  relatedMemoryIds    String[]
+  documentRefs        String[]
+  invalidDocumentRefs String[]
+
+  reason      GraveyardReason
+  buriedAt    DateTime @default(now())
+  restoreHint String?
+  snapshot    Json?
+
+  @@index([namespaceId, reason])
+  @@index([namespaceId, buriedAt])
+  @@index([originalMemoryId])
+  @@index([replacedById])
+  @@map("memory_graveyard_entries")
+}
+
+model MemoryContradiction {
+  id          String    @id @default(cuid())
+  namespaceId String
+  namespace   Namespace @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+
+  memoryAId String
+  memoryBId String
+
+  memoryASummary String?
+  memoryBSummary String?
+
+  similarity       Float
+  contradictionKind String?
+  detectedBy       String?
+  status           ContradictionStatus @default(DETECTED)
+  resolution       ContradictionResolution?
+  winnerMemoryId   String?
+  loserMemoryId    String?
+  rationale        String?
+  resolvedBy       String?
+  metadata         Json?
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([namespaceId, status])
+  @@index([namespaceId, createdAt])
+  @@index([memoryAId])
+  @@index([memoryBId])
+  @@index([winnerMemoryId])
+  @@index([loserMemoryId])
+  @@map("memory_contradictions")
+}
+
+model MemoryStats {
+  id          String    @id @default(cuid())
+  namespaceId String    @unique
+  namespace   Namespace @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+
+  totalMemories             Int   @default(0)
+  activeMemories            Int   @default(0)
+  archivedMemories          Int   @default(0)
+  graveyardMemories         Int   @default(0)
+  contradictionCount        Int   @default(0)
+  resolvedContradictions    Int   @default(0)
+  totalRecalls              Int   @default(0)
+  avgRelevance              Float @default(0)
+
+  factCount                 Int @default(0)
+  decisionCount             Int @default(0)
+  learningCount             Int @default(0)
+  preferenceCount           Int @default(0)
+  todoCount                 Int @default(0)
+  contextCount              Int @default(0)
+
+  criticalCount             Int @default(0)
+  dailyCount                Int @default(0)
+  archiveTierCount          Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("memory_stats")
+}
+

@@ -1,0 +1,57 @@
+"""Public package exports for snipara-memory."""
+
+from .adapters import InMemoryMemoryStore
+from .api import create_app
+from .domain import (
+    CompactionResult,
+    Contradiction,
+    ContradictionResolution,
+    ContradictionStatus,
+    GraveyardEntry,
+    GraveyardReason,
+    Memory,
+    MemoryScope,
+    MemoryService,
+    MemoryStatus,
+    MemoryTier,
+    MemoryType,
+    Namespace,
+    NamespaceType,
+    RecallMatch,
+    RecallQuery,
+    ResolveContradictionRequest,
+    SessionMemoryBundle,
+    StoreMemoryRequest,
+    calculate_confidence_decay,
+    classify_memory_tier,
+)
+from .ports import CacheStore, EmbeddingsProvider, MemoryStore
+
+__all__ = [
+    "CacheStore",
+    "CompactionResult",
+    "Contradiction",
+    "ContradictionResolution",
+    "ContradictionStatus",
+    "EmbeddingsProvider",
+    "GraveyardEntry",
+    "GraveyardReason",
+    "InMemoryMemoryStore",
+    "Memory",
+    "MemoryScope",
+    "MemoryService",
+    "MemoryStatus",
+    "MemoryStore",
+    "MemoryTier",
+    "MemoryType",
+    "Namespace",
+    "NamespaceType",
+    "RecallMatch",
+    "RecallQuery",
+    "ResolveContradictionRequest",
+    "SessionMemoryBundle",
+    "StoreMemoryRequest",
+    "calculate_confidence_decay",
+    "classify_memory_tier",
+    "create_app",
+]

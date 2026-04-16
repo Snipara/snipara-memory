@@ -1,0 +1,47 @@
+"""Domain exports for snipara-memory."""
+
+from .models import (
+    CompactionResult,
+    Contradiction,
+    ContradictionResolution,
+    ContradictionStatus,
+    GraveyardEntry,
+    GraveyardReason,
+    Memory,
+    MemoryScope,
+    MemoryStatus,
+    MemoryTier,
+    MemoryType,
+    Namespace,
+    NamespaceType,
+    RecallMatch,
+    RecallQuery,
+    ResolveContradictionRequest,
+    SessionMemoryBundle,
+    StoreMemoryRequest,
+)
+from .service import MemoryService, calculate_confidence_decay, classify_memory_tier
+
+__all__ = [
+    "CompactionResult",
+    "Contradiction",
+    "ContradictionResolution",
+    "ContradictionStatus",
+    "GraveyardEntry",
+    "GraveyardReason",
+    "Memory",
+    "MemoryScope",
+    "MemoryService",
+    "MemoryStatus",
+    "MemoryTier",
+    "MemoryType",
+    "Namespace",
+    "NamespaceType",
+    "RecallMatch",
+    "RecallQuery",
+    "ResolveContradictionRequest",
+    "SessionMemoryBundle",
+    "StoreMemoryRequest",
+    "calculate_confidence_decay",
+    "classify_memory_tier",
+]
