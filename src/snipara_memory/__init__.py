@@ -1,6 +1,8 @@
 """Public package exports for snipara-memory."""
 
-from .adapters import InMemoryMemoryStore
+from importlib.metadata import PackageNotFoundError, version
+
+from .adapters import InMemoryMemoryStore, JsonFileMemoryStore, get_default_store_path
 from .api import create_app
 from .domain import (
     CompactionResult,
@@ -27,6 +29,11 @@ from .domain import (
 )
 from .ports import CacheStore, EmbeddingsProvider, MemoryStore
 
+try:
+    __version__ = version("snipara-memory")
+except PackageNotFoundError:
+    __version__ = "0.1.0"
+
 __all__ = [
     "CacheStore",
     "CompactionResult",
@@ -37,6 +44,7 @@ __all__ = [
     "GraveyardEntry",
     "GraveyardReason",
     "InMemoryMemoryStore",
+    "JsonFileMemoryStore",
     "Memory",
     "MemoryScope",
     "MemoryService",
@@ -51,7 +59,9 @@ __all__ = [
     "ResolveContradictionRequest",
     "SessionMemoryBundle",
     "StoreMemoryRequest",
+    "__version__",
     "calculate_confidence_decay",
     "classify_memory_tier",
     "create_app",
+    "get_default_store_path",
 ]

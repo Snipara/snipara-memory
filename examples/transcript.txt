@@ -1,0 +1,4 @@
+user: We decided to use RS256 token pairs and refresh tokens for JWT auth.
+assistant: Prefer explicit memory lifecycle states over silent overwrites.
+user: TODO next step is to add a reproducible benchmark harness for memory recall.
+assistant: The policy is that automatic memory writes should land in a review queue before persistence.

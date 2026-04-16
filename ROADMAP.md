@@ -8,20 +8,24 @@ Already available in `0.1.x`:
 
 - memory domain model
 - in-memory store
+- JSON file store
 - semantic recall
 - session bundle loading
 - contradiction detection and resolution
 - graveyard lifecycle
 - minimal FastAPI API
+- MCP wrapper
+- transcript and project-doc import CLI
+- reproducible benchmark harness
 
 ## Next
 
 1. Prisma-backed persistence adapter
-2. reproducible benchmark harness
-3. pluggable embeddings providers
-4. richer filtering and namespace stats
-5. Redis-backed session cache
-6. MCP wrapper package
+2. pluggable embeddings providers
+3. richer filtering and namespace stats
+4. Redis-backed session cache
+5. larger benchmark suites
+6. export, backup, and migration tooling
 
 ## After That
 

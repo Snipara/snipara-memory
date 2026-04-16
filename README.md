@@ -113,7 +113,11 @@ Version `0.1.x` includes:
 - a memory service for storage, recall, session loading, compaction, and
   contradiction resolution
 - an in-memory adapter for local runs and tests
+- a JSON file store for local persistent usage
 - a minimal FastAPI app
+- a local MCP wrapper for MCP-compatible clients
+- transcript and project-doc import commands
+- a reproducible benchmark harness
 - a Prisma schema draft for a production persistence adapter
 - runnable examples for store, recall, and contradiction resolution
 
@@ -150,6 +154,18 @@ For local development:
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Main CLI:
+
+```bash
+snipara-memory version
+```
+
+Local store path by default:
+
+```text
+~/.snipara-memory/store.json
 ```
 
 ## Python Quickstart
@@ -189,12 +205,19 @@ Runnable example:
 python examples/quickstart.py
 ```
 
-## Run The Local API
-
-The package ships with a minimal API server backed by the in-memory adapter.
+Persistent local import:
 
 ```bash
-python -m snipara_memory --host 127.0.0.1 --port 8000
+snipara-memory import-transcript examples/transcript.txt --namespace demo
+```
+
+## Run The Local API
+
+The package ships with a minimal API server backed by the local JSON store by
+default.
+
+```bash
+snipara-memory serve --host 127.0.0.1 --port 8000
 ```
 
 Example requests:
@@ -225,6 +248,64 @@ Contradiction example:
 ```bash
 python examples/contradiction_flow.py
 ```
+
+## Run The Local MCP Server
+
+The package also ships with a local MCP stdio wrapper.
+
+```bash
+snipara-memory mcp
+```
+
+With an explicit store file:
+
+```bash
+snipara-memory mcp --store-path ./.snipara-memory.json
+```
+
+Current MCP tools:
+
+- `memory_store`
+- `memory_recall`
+- `memory_session_bundle`
+- `memory_list`
+- `memory_detect_contradictions`
+- `memory_resolve_contradiction`
+- `memory_import_transcript`
+- `memory_import_project`
+
+See [docs/mcp.md](docs/mcp.md).
+
+## Import Durable Memory
+
+Transcript import:
+
+```bash
+snipara-memory import-transcript examples/transcript.txt --namespace demo
+```
+
+Project-doc import:
+
+```bash
+snipara-memory import-project docs/ --namespace demo
+```
+
+These importers are intentionally conservative. They try to extract durable
+decisions, preferences, learnings, and todos instead of storing every line.
+
+See [docs/importers.md](docs/importers.md).
+
+## Benchmark Harness
+
+Run the reproducible recall harness:
+
+```bash
+snipara-memory benchmark benchmarks/datasets/basic_recall.jsonl
+```
+
+This is a regression harness, not a headline benchmark claim.
+
+See [benchmarks/README.md](benchmarks/README.md).
 
 ## Why Not Just Keep Raw Transcripts?
 
@@ -287,24 +368,28 @@ Current state:
 
 - domain service: implemented
 - in-memory store: implemented
+- JSON file store: implemented
 - HTTP API: implemented
+- MCP wrapper: implemented
+- transcript/project import CLI: implemented
+- reproducible benchmark harness: implemented
 - Prisma/Redis/embeddings production adapters: not published yet
 
 We are intentionally not making benchmark claims yet. The current public value
 is clarity, inspectability, and a reusable memory lifecycle for coding agents.
-Benchmarking will be published when the harness is reproducible from this
-repository.
+The benchmark harness is now reproducible from this repository, but it is still
+positioned as a regression harness rather than a competitive research claim.
 
 ## Roadmap
 
 Near-term roadmap:
 
 1. Prisma-backed persistence adapter
-2. public benchmark harness and reproducible eval data
-3. pluggable embeddings provider packages
-4. Redis-backed session bundle cache
-5. richer recall filtering and namespace stats
-6. MCP wrapper package on top of the standalone engine
+2. pluggable embeddings provider packages
+3. Redis-backed session bundle cache
+4. richer recall filtering and namespace stats
+5. larger public benchmark suites
+6. richer CLI inspection and export flows
 
 More detail: [ROADMAP.md](ROADMAP.md)
 
@@ -316,6 +401,7 @@ Start here:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [ROADMAP.md](ROADMAP.md)
+- [docs/INDEX.md](docs/INDEX.md)
 
 ## Relation To Snipara
 

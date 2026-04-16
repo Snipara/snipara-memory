@@ -8,7 +8,7 @@ license = "Apache-2.0"
 authors = [
     { name = "Snipara" },
 ]
-keywords = ["memory", "ai-agents", "coding-agents", "semantic-recall", "fastapi"]
+keywords = ["memory", "ai-agents", "coding-agents", "semantic-recall", "fastapi", "mcp", "persistent-memory"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -21,24 +21,30 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.109.0",
+    "mcp>=1.25.0",
     "pydantic>=2.5.0",
     "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2.2",
     "httpx>=0.27.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
 ]
 
 [project.urls]
 Homepage = "https://snipara.com"
 Repository = "https://github.com/Snipara/snipara-memory"
 Issues = "https://github.com/Snipara/snipara-memory/issues"
+Documentation = "https://github.com/Snipara/snipara-memory/tree/main/docs"
 
 [project.scripts]
-snipara-memory-api = "snipara_memory.__main__:main"
+snipara-memory = "snipara_memory.cli:main"
+snipara-memory-api = "snipara_memory.cli:main"
+snipara-memory-mcp = "snipara_memory.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

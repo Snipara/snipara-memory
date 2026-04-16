@@ -32,6 +32,12 @@ python examples/quickstart.py
 python examples/contradiction_flow.py
 ```
 
+Run the benchmark harness:
+
+```bash
+snipara-memory benchmark benchmarks/datasets/basic_recall.jsonl
+```
+
 ## Contribution Areas
 
 High-value contributions right now:
