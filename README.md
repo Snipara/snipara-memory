@@ -61,14 +61,14 @@ That makes it closer to a durable memory engine than a simple vector wrapper.
 
 ## Transcript Store vs Durable Memory Engine
 
-| Need | Transcript-first memory | `snipara-memory` |
-| --- | --- | --- |
-| Keep the original conversation | Strong | Not the main goal |
-| Preserve durable decisions and conventions | Usually ad hoc | First-class |
-| Handle conflicting memories over time | Rare | Built-in |
-| Archive without hard deletion | Rare | Built-in graveyard |
-| Warm up a new coding session | Manual | Session bundle loading |
-| Model project memory as typed objects | Limited | Built-in |
+| Need                                       | Transcript-first memory | `snipara-memory`       |
+| ------------------------------------------ | ----------------------- | ---------------------- |
+| Keep the original conversation             | Strong                  | Not the main goal      |
+| Preserve durable decisions and conventions | Usually ad hoc          | First-class            |
+| Handle conflicting memories over time      | Rare                    | Built-in               |
+| Archive without hard deletion              | Rare                    | Built-in graveyard     |
+| Warm up a new coding session               | Manual                  | Session bundle loading |
+| Model project memory as typed objects      | Limited                 | Built-in               |
 
 If your main problem is "search my old chats", a transcript store is enough.
 If your main problem is "my coding agent should keep stable project memory",

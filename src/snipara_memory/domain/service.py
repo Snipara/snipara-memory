@@ -426,11 +426,11 @@ class MemoryService:
             ranked = sorted(
                 group,
                 key=lambda memory: (
-                    memory.confidence,
-                    memory.last_accessed_at or memory.created_at,
-                    memory.created_at,
+                    -memory.confidence,
+                    -(memory.access_count),
+                    (memory.last_accessed_at or memory.created_at).timestamp(),
+                    memory.created_at.timestamp(),
                 ),
-                reverse=True,
             )
             for loser in ranked[1:]:
                 await self.move_to_graveyard(loser.id, reason=GraveyardReason.DUPLICATE)
