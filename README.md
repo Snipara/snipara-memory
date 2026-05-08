@@ -1,174 +1,119 @@
 # snipara-memory
 
-`snipara-memory` is an open source memory engine for coding agents.
+`snipara-memory` is an open source memory schema and local engine for
+AI-assisted projects.
 
-Transcript memory remembers what was said. `snipara-memory` remembers what
-should keep mattering.
+**Memory belongs to the project, not the model.**
 
-It is the extraction of Snipara's reusable memory domain into a small open
-source package that can run without Snipara Cloud, billing, or multi-tenant
-SaaS concerns.
+Use it to model, store, recall, compact, archive, and review durable project
+memory without depending on Snipara Cloud.
 
-The goal is simple:
+## What It Is
 
-- store durable memories
-- recall them semantically
-- load session bundles by tier
-- compact or archive low-value memory
-- detect and resolve contradictions
+`snipara-memory` provides project-scoped memory primitives:
 
-## TL;DR
+- memory object types
+- lifecycle states
+- source provenance
+- authority metadata
+- semantic recall requests
+- contradiction records
+- session warm-up bundles
+- local API and MCP wrappers
 
-If your agent forgets decisions between sessions, `snipara-memory` gives you a
-small local memory layer you can embed into your own tooling.
+It is not a generic vector database. It is the shared memory language for
+agents that need to remember what should keep mattering.
 
-It is built for cases like:
+## The Problem
 
-- coding conventions that should survive restarts
-- durable project decisions
-- reusable learnings from previous sessions
-- session warm-up bundles for agents
-- memory stores that need auditability instead of silent overwrites
+Most agent memory systems are either transcript stores or embedding caches.
+They can retrieve old text, but they rarely answer the deeper workflow question:
 
-## The Open Source Wedge
+What should a future agent trust, reuse, or revisit?
 
-`snipara-memory` is not trying to win by being a generic "AI memory" bucket.
+Durable project memory needs structure:
 
-The wedge is narrower and more useful:
+- decisions need authority and source context
+- preferences need scope
+- learnings need confidence
+- stale memories need retirement
+- conflicting memories need review
+- session startup needs compact bundles
 
-- durable memory for coding agents
-- explicit memory lifecycle instead of raw transcript dumps
-- contradiction handling instead of silent duplication
-- auditable graveyard state instead of destructive deletes
-- session warm-up bundles instead of ad hoc prompt stuffing
+## The Solution
 
-If the open source package is not clearly better for this job, it will not help
-Snipara. That is the quality bar for this repository.
+`snipara-memory` gives those concepts a small, inspectable implementation.
+
+```text
+Agent Session
+     |
+     v
+Memory Extraction
+     |
+     v
+Project-Scoped Memory Objects
+     |
+     +--> Recall
+     +--> Session Bundle
+     +--> Compaction
+     +--> Contradiction Review
+     +--> Archive / Graveyard
+```
+
+The package can run locally in tests, CLIs, prototypes, and MCP-compatible
+developer tools. Hosted Snipara builds on the same domain concepts with managed
+retrieval, review workflows, ranking, team controls, and production operations.
+
+## Architecture
+
+```text
+Claude Code       Cursor          Codex          OpenAI Agents
+    |               |              |                  |
+    +---------------+--------------+------------------+
+                    |
+          Project Memory Interface
+                    |
+             snipara-memory
+                    |
+       Local Store / API / MCP Wrapper
+                    |
+          Durable Project Context
+```
 
 ## Why This Is Different
 
-Many memory tools stop at "store text, run semantic search".
+Many tools stop at "store text, run semantic search".
 
-`snipara-memory` goes further on the memory lifecycle itself:
+`snipara-memory` focuses on the memory lifecycle:
 
 - tiered retrieval: `CRITICAL`, `DAILY`, `ARCHIVE`
-- explicit lifecycle states: `ACTIVE`, `ARCHIVED`, `GRAVEYARD`
-- contradiction tracking and resolution
-- graveyard restore flow instead of destructive deletes
-- session bundle loading for agent warm-up
+- lifecycle states: `ACTIVE`, `ARCHIVED`, `GRAVEYARD`
+- scoped memory ownership
+- contradiction detection and resolution
+- graveyard restore instead of destructive deletes
+- session bundles for agent warm-up
+- importers for transcripts and project docs
 
-That makes it closer to a durable memory engine than a simple vector wrapper.
+## Transcript Store vs Durable Memory
 
-## Transcript Store vs Durable Memory Engine
+| Need | Transcript-first memory | `snipara-memory` |
+| --- | --- | --- |
+| Keep the original conversation | Strong | Not the main goal |
+| Preserve durable decisions | Usually ad hoc | First-class |
+| Scope memory to projects | Often weak | Built-in |
+| Handle contradictions | Rare | Built-in |
+| Archive without hard delete | Rare | Built-in graveyard |
+| Warm up a new session | Manual | Session bundles |
+| Model memory as typed objects | Limited | Built-in |
 
-| Need                                       | Transcript-first memory | `snipara-memory`       |
-| ------------------------------------------ | ----------------------- | ---------------------- |
-| Keep the original conversation             | Strong                  | Not the main goal      |
-| Preserve durable decisions and conventions | Usually ad hoc          | First-class            |
-| Handle conflicting memories over time      | Rare                    | Built-in               |
-| Archive without hard deletion              | Rare                    | Built-in graveyard     |
-| Warm up a new coding session               | Manual                  | Session bundle loading |
-| Model project memory as typed objects      | Limited                 | Built-in               |
-
-If your main problem is "search my old chats", a transcript store is enough.
-If your main problem is "my coding agent should keep stable project memory",
-this repository is a better fit.
-
-## Why This Exists
-
-Snipara the SaaS product has grown into a larger surface:
-
-- hosted MCP
-- reviewed project memory
-- automation policies
-- team and workspace controls
-- analytics and managed infrastructure
-
-That full product is useful, but too heavy if all you want is a local memory
-engine for agents.
-
-`snipara-memory` is the smaller open source layer.
-
-## Who This Is For
-
-Use `snipara-memory` if you are building:
-
-- coding agents
-- local-first agent tools
-- MCP-compatible developer tooling
-- persistent session memory
-- project memory layers for your own apps
-
-Do not use it if you are looking for:
-
-- a full hosted MCP platform
-- a SaaS dashboard for team memory review
-- billing, auth, and tenant management
-
-## What Is Included
-
-Version `0.1.x` includes:
-
-- a standalone domain model for memories, graveyard entries, and contradictions
-- a memory service for storage, recall, session loading, compaction, and
-  contradiction resolution
-- an in-memory adapter for local runs and tests
-- a JSON file store for local persistent usage
-- a minimal FastAPI app
-- a local MCP wrapper for MCP-compatible clients
-- transcript and project-doc import commands
-- a reproducible benchmark harness
-- a Prisma schema draft for a production persistence adapter
-- runnable examples for store, recall, and contradiction resolution
-
-## What Is Not Included
-
-This repository does **not** try to clone Snipara Cloud.
-
-Not included:
-
-- billing and plan gating
-- hosted MCP transport
-- SaaS auth and project/team UI
-- approval workflows and review queue
-- managed automation policies
-- enterprise admin and analytics
-
-Those remain part of Snipara's commercial hosted product.
-
-## Relationship To Automation Runtimes
-
-`snipara-memory` is a memory engine, not a session-lifecycle runtime.
-
-It fits well behind local or hosted automation layers that want to:
-
-- capture session events
-- extract durable observations
-- store and recall memories
-- assemble session warm-up bundles
-
-It does **not** own:
-
-- IDE or client hook installation
-- cross-client event normalization
-- context injection policy for interactive sessions
-- hosted analytics, review workflows, or orchestration
-
-That boundary is intentional. The package stays useful as a standalone memory
-domain instead of turning into a full agent platform.
+If your main problem is "search my old chats", a transcript store may be
+enough. If your main problem is "my agent should keep stable project memory",
+this package is the right layer.
 
 ## Install
 
-Until the first PyPI release is published, install from GitHub:
-
 ```bash
-pip install git+https://github.com/Snipara/snipara-memory.git
-```
-
-Or clone locally:
-
-```bash
-pip install -e .
+pip install snipara-memory
 ```
 
 For local development:
@@ -188,24 +133,6 @@ Local store path by default:
 ```text
 ~/.snipara-memory/store.json
 ```
-
-## Publishing
-
-The repository is already wired for trusted publishing from GitHub Actions via
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml).
-
-If the publish job fails with `invalid-publisher`, the remaining setup is on the
-PyPI side, not in the package code.
-
-Required trusted publisher settings on PyPI:
-
-- owner/repository: `Snipara/snipara-memory`
-- workflow file: `.github/workflows/publish.yml`
-- branch: `main`
-- environment: `pypi`
-
-Once that publisher exists on PyPI, pushing to `main` or running the workflow
-manually will publish the package.
 
 ## Python Quickstart
 
@@ -244,26 +171,33 @@ Runnable example:
 python examples/quickstart.py
 ```
 
-Persistent local import:
+Import a transcript:
 
 ```bash
 snipara-memory import-transcript examples/transcript.txt --namespace demo
 ```
 
-## Run The Local API
+Import project documents:
 
-The package ships with a minimal API server backed by the local JSON store by
-default.
+```bash
+snipara-memory import-project docs --namespace demo
+```
+
+## Local API
+
+Start the FastAPI server backed by the local JSON store:
 
 ```bash
 snipara-memory serve --host 127.0.0.1 --port 8000
 ```
 
-Example requests:
+Health check:
 
 ```bash
 curl http://127.0.0.1:8000/health
 ```
+
+Store a memory:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories \
@@ -274,6 +208,8 @@ curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories \
   }'
 ```
 
+Recall memory:
+
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories/recall \
   -H "content-type: application/json" \
@@ -282,15 +218,9 @@ curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories/recall \
   }'
 ```
 
-Contradiction example:
+## Local MCP Server
 
-```bash
-python examples/contradiction_flow.py
-```
-
-## Run The Local MCP Server
-
-The package also ships with a local MCP stdio wrapper.
+Run the stdio MCP wrapper:
 
 ```bash
 snipara-memory mcp
@@ -315,146 +245,82 @@ Current MCP tools:
 
 See [docs/mcp.md](docs/mcp.md).
 
-## Import Durable Memory
+## What Is Included
 
-Transcript import:
+Version `0.1.x` includes:
+
+- standalone domain models
+- memory service
+- in-memory adapter
+- JSON file store
+- FastAPI app
+- MCP stdio wrapper
+- transcript and project-doc importers
+- benchmark harness
+- Prisma schema draft
+- runnable examples
+
+## What Is Not Included
+
+This repository does not try to clone Snipara Cloud.
+
+Not included:
+
+- hosted MCP transport
+- SaaS auth and billing
+- team dashboard
+- review queues
+- managed retrieval ranking
+- enterprise analytics
+- hosted automation policies
+
+Those remain part of Snipara's commercial hosted product.
+
+## Open Core Boundary
+
+Open source:
+
+- memory schemas
+- lifecycle primitives
+- local storage interfaces
+- import formats
+- local API and MCP wrappers
+- tests and examples
+
+Commercial Snipara:
+
+- hosted orchestration
+- managed context ranking
+- review and governance workflows
+- team and tenant controls
+- production analytics
+- operational reliability
+
+The language is open. The managed cognition layer is Snipara.
+
+## Relationship To Other Repos
+
+| Repo | Role |
+| --- | --- |
+| `Snipara/snipara-server` | Hosted and self-hosted server surface |
+| `alopez3006/snipara-mcp` | Lightweight stdio MCP connector |
+| `Snipara/snipara-memory` | This open memory schema and local engine |
+
+## Development
 
 ```bash
-snipara-memory import-transcript examples/transcript.txt --namespace demo
+pip install -e ".[dev]"
+pytest
+ruff check .
 ```
 
-Project-doc import:
+Useful docs:
 
-```bash
-snipara-memory import-project docs/ --namespace demo
-```
-
-These importers are intentionally conservative. They try to extract durable
-decisions, preferences, learnings, and todos instead of storing every line.
-
-See [docs/importers.md](docs/importers.md).
-
-## Benchmark Harness
-
-Run the reproducible recall harness:
-
-```bash
-snipara-memory benchmark benchmarks/datasets/basic_recall.jsonl
-```
-
-This is a regression harness, not a headline benchmark claim.
-
-See [benchmarks/README.md](benchmarks/README.md).
-
-## Why Not Just Keep Raw Transcripts?
-
-Raw conversation storage is useful, but it is not enough on its own for durable
-agent memory.
-
-`snipara-memory` adds structure on top of stored content:
-
-- typed memories (`FACT`, `DECISION`, `LEARNING`, `PREFERENCE`, `TODO`, `CONTEXT`)
-- explicit retrieval tiers
-- lifecycle transitions
-- contradiction handling
-- graveyard snapshots for auditability
-
-If you only need searchable transcript history, a transcript store may be
-enough. If you need reusable project memory with lifecycle rules, this package
-is the better fit.
-
-## Core Concepts
-
-- `Namespace`: the container for a memory corpus
-- `Memory`: a durable fact, decision, learning, preference, todo, or context item
-- `Tier`: `CRITICAL`, `DAILY`, `ARCHIVE`
-- `Status`: `ACTIVE`, `ARCHIVED`, `GRAVEYARD`
-- `Graveyard`: tombstoned or superseded memory snapshots kept for auditability
-- `Contradiction`: tracked overlap/conflict between memories before or after resolution
-
-## Public API
-
-Main exports:
-
-```python
-from snipara_memory import (
-    InMemoryMemoryStore,
-    MemoryService,
-    RecallQuery,
-    StoreMemoryRequest,
-    ResolveContradictionRequest,
-)
-```
-
-Key operations:
-
-- `store_memory`
-- `store_memories_bulk`
-- `semantic_recall`
-- `list_memories`
-- `get_session_memories`
-- `compact_memories`
-- `detect_contradictions`
-- `resolve_contradiction`
-- `move_to_graveyard`
-- `restore_from_graveyard`
-
-## Project Status
-
-`snipara-memory` is usable today for local experiments and OSS integration work.
-
-Current state:
-
-- domain service: implemented
-- in-memory store: implemented
-- JSON file store: implemented
-- HTTP API: implemented
-- MCP wrapper: implemented
-- transcript/project import CLI: implemented
-- reproducible benchmark harness: implemented
-- Prisma/Redis/embeddings production adapters: not published yet
-
-We are intentionally not making benchmark claims yet. The current public value
-is clarity, inspectability, and a reusable memory lifecycle for coding agents.
-The benchmark harness is now reproducible from this repository, but it is still
-positioned as a regression harness rather than a competitive research claim.
-
-## Roadmap
-
-Near-term roadmap:
-
-1. Prisma-backed persistence adapter
-2. pluggable embeddings provider packages
-3. Redis-backed session bundle cache
-4. richer recall filtering and namespace stats
-5. larger public benchmark suites
-6. richer CLI inspection and export flows
-
-More detail: [ROADMAP.md](ROADMAP.md)
-
-## Contributing
-
-Contributions are welcome.
-
-Start here:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [ROADMAP.md](ROADMAP.md)
-- [docs/INDEX.md](docs/INDEX.md)
-
-## Relation To Snipara
-
-Snipara Cloud builds on top of this kind of memory domain and adds:
-
-- hosted MCP surface
-- reviewable memory queue
-- transcript import
-- workspace profiles
-- automation policies
-- team controls and managed operations
-
-Project site: [snipara.com](https://snipara.com)
+- [Getting started](docs/getting-started.md)
+- [MCP wrapper](docs/mcp.md)
+- [Importers](docs/importers.md)
+- [Publishing](docs/publishing.md)
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

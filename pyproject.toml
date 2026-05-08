@@ -1,14 +1,14 @@
 [project]
 name = "snipara-memory"
 version = "0.1.0"
-description = "Standalone memory engine for coding agents"
+description = "Project-scoped memory primitives for AI-assisted projects"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
     { name = "Snipara" },
 ]
-keywords = ["memory", "ai-agents", "coding-agents", "semantic-recall", "fastapi", "mcp", "persistent-memory"]
+keywords = ["memory", "ai-agents", "coding-agents", "semantic-recall", "project-memory", "fastapi", "mcp", "persistent-memory"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
