@@ -42,6 +42,13 @@ async def import_transcript(
     source: str | None = None,
     max_items: int | None = None,
 ) -> ImportPlan:
+    """Import a transcript file into the memory store.
+
+    Parses role:content pairs or JSON messages, extracts durable facts/decisions/
+    learnings using keyword patterns, and stores them with namespace and source
+    attribution. Returns an import plan with counts of scanned, imported, and
+    skipped items.
+    """
     messages = load_transcript_messages(path)
     requests = extract_transcript_requests(
         messages,
@@ -68,6 +75,12 @@ async def import_project_documents(
     extensions: set[str] | None = None,
     max_items: int | None = None,
 ) -> ImportPlan:
+    """Import project documentation into the memory store.
+
+    Walks a directory tree for supported file types (Markdown, reStructuredText,
+    plain text), extracts sections and facts, and stores them with namespace
+    attribution. Useful for seeding project memory from existing docs.
+    """
     source_path = Path(path)
     files = _collect_project_files(source_path, extensions=extensions)
     requests = extract_project_requests(files, namespace_id=namespace_id)

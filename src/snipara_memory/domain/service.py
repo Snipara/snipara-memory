@@ -80,6 +80,12 @@ class MemoryService:
         self._cache = cache
 
     async def store_memory(self, request: StoreMemoryRequest) -> Memory:
+        """Store a single memory object.
+
+        Persists the memory to the backing store, generates an embedding if none
+        was provided and an embeddings provider is available, and invalidates
+        the namespace cache so session bundles refresh on next access.
+        """
         memory = self._build_memory(request)
         embedding = request.embedding
 
@@ -94,6 +100,11 @@ class MemoryService:
         self,
         requests: list[StoreMemoryRequest],
     ) -> list[Memory]:
+        """Store multiple memory objects in a single batch.
+
+        More efficient than individual store_memory calls: reuses embeddings
+        computation and defers cache invalidation to one operation per namespace.
+        """
         if not requests:
             return []
 
@@ -113,6 +124,14 @@ class MemoryService:
         return created
 
     async def semantic_recall(self, query: RecallQuery) -> list[RecallMatch]:
+        """Recall memories matching a semantic query.
+
+        Generates an embedding for the query (if an embeddings provider is
+        available), searches the store, applies confidence decay to filter
+        stale memories below the query's min_confidence threshold, updates
+        access counts and timestamps for recall metrics, and returns the top-k
+        matches sorted by relevance score.
+        """
         query_embedding: list[float] | None = None
         if self._embeddings is not None:
             query_embedding = await self._embeddings.embed_text(query.query)
@@ -156,6 +175,11 @@ class MemoryService:
         types: list[MemoryType] | None = None,
         limit: int | None = None,
     ) -> list[Memory]:
+        """List memories in a namespace, with optional filters.
+
+        Delegates to the backing store; filters are applied server-side.
+        Returns unranked results; use get_session_memories for ranked bundles.
+        """
         return await self._store.list_memories(
             namespace_id,
             statuses=statuses,
@@ -172,6 +196,13 @@ class MemoryService:
         daily_limit: int = 20,
         archive_limit: int = 20,
     ) -> SessionMemoryBundle:
+        """Build a tiered session memory bundle for agent warm-up.
+
+        Fetches all active and archived memories, ranks them by tier (CRITICAL
+        first, then DAILY, then ARCHIVE), applies per-tier limits, caches the
+        result, and returns a compact bundle ready for an agent session startup.
+        Cache TTL and per-tier budgets are configurable.
+        """
         cache_key = (
             f"session:{namespace_id}:"
             f"{critical_limit}:{daily_limit}:{archive_limit}"

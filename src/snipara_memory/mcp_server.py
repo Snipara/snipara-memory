@@ -272,6 +272,13 @@ def create_server(service: MemoryService) -> Server:
 
 
 async def run_stdio_server(*, store_path: str | None = None, in_memory: bool = False) -> None:
+    """Run the snipara-memory MCP server over stdio.
+
+    This is the entry point for CLI usage via `snipara-memory mcp`. It initializes
+    the memory service with the chosen store (persistent JSON or ephemeral
+    in-memory), creates the MCP server, and runs it listening on stdin/stdout.
+    Compatible with Claude Code, Cursor, and other MCP-aware tools.
+    """
     store = InMemoryMemoryStore() if in_memory else JsonFileMemoryStore(store_path)
     service = MemoryService(store=store)
     server = create_server(service)

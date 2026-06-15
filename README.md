@@ -8,6 +8,52 @@ AI-assisted projects.
 Use it to model, store, recall, compact, archive, and review durable project
 memory without depending on Snipara Cloud.
 
+## Quickstart
+
+```bash
+# 1. Install
+pip install snipara-memory
+
+# 2. Use the local API
+snipara-memory serve --port 8000
+
+# 3. In another terminal, store and recall
+curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories \
+  -H "content-type: application/json" \
+  -d '{"title": "Auth convention", "content": "JWT auth uses RS256 token pairs."}'
+
+curl -X POST http://127.0.0.1:8000/v1/namespaces/demo/memories/recall \
+  -H "content-type: application/json" \
+  -d '{"query": "How do we handle auth?"}'
+```
+
+Or use the Python API:
+
+```python
+import asyncio
+from snipara_memory import InMemoryMemoryStore, MemoryService, RecallQuery, StoreMemoryRequest
+
+async def main():
+    store = InMemoryMemoryStore()
+    service = MemoryService(store=store)
+    
+    await service.store_memory(StoreMemoryRequest(
+        namespace_id="demo",
+        content="JWT auth uses RS256 token pairs and refresh tokens.",
+        title="Auth convention",
+    ))
+    
+    matches = await service.semantic_recall(
+        RecallQuery(namespace_id="demo", query="How do we handle JWT auth?")
+    )
+    for match in matches:
+        print(f"{match.score:.2f}: {match.memory.title}")
+
+asyncio.run(main())
+```
+
+Full docs below. Local continuity works out-of-the-box; import commands and MCP are optional.
+
 ## What It Is
 
 `snipara-memory` provides project-scoped memory primitives:

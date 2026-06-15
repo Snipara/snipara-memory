@@ -45,6 +45,7 @@ class JsonFileMemoryStore(InMemoryMemoryStore):
         *,
         embedding: list[float] | tuple[float, ...] | None = None,
     ) -> Memory:
+        """Create a memory and persist to the JSON file."""
         created = await super().create_memory(memory, embedding=embedding)
         self._write_state()
         return created
