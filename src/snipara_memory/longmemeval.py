@@ -344,6 +344,7 @@ class LmStudioFactExtractor:
         for attempt in range(self.retries + 1):
             try:
                 response = await asyncio.to_thread(self._post_json, payload)
+                return _facts_from_lm_studio_response(response)
             except _LmStudioRequestError as error:
                 if attempt >= self.retries:
                     raise RuntimeError(
@@ -351,7 +352,13 @@ class LmStudioFactExtractor:
                     ) from error
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
-            return _facts_from_lm_studio_response(response)
+            except ValueError as error:
+                if attempt >= self.retries:
+                    raise ValueError(
+                        "LM Studio returned invalid structured facts after "
+                        f"{attempt + 1} attempts: {error}"
+                    ) from error
+                await asyncio.sleep(min(2**attempt, 8))
         raise AssertionError("LM Studio retry loop exited unexpectedly")
 
     def _build_payload(self, session: LongMemEvalSession) -> dict[str, Any]:

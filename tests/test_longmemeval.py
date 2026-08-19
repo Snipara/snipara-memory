@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import threading
 from typing import Any, Iterator
 
 from snipara_memory import (
@@ -173,7 +174,7 @@ def _json_server(response_payload: dict[str, Any]) -> Iterator[ThreadingHTTPServ
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.requests = []
-    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield server
