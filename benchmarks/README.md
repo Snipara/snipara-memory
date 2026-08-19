@@ -102,6 +102,8 @@ snipara-memory longmemeval-ingest \
   --extractor lm-studio \
   --model "$LM_STUDIO_MODEL" \
   --limit 50 \
+  --max-tokens 2048 \
+  --retries 4 \
   --cache .cache/longmemeval-lmstudio.json \
   --json
 ```
@@ -112,6 +114,8 @@ and supersession keys. The dataset's `has_answer` evaluation labels are
 deliberately omitted from the model input. `--prompt-version` and the model
 identifier are part of the cache key, so changing either starts a fresh
 extraction pass while preserving the previous cache for comparison.
+Transport failures and malformed structured responses are retried with a
+bounded backoff.
 
 The first pass is compute-bound and can take a long time on a local model.
 Replay the same command to use the cache, and do not interpret this ingestion

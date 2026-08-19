@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cache-busting extraction prompt version",
     )
     longmemeval.add_argument("--temperature", type=float, default=0.0)
-    longmemeval.add_argument("--max-tokens", type=int, default=1024)
+    longmemeval.add_argument("--max-tokens", type=int, default=2048)
     longmemeval.add_argument("--timeout", type=float, default=120.0)
     longmemeval.add_argument("--retries", type=int, default=2)
     longmemeval.add_argument("--json", action="store_true", help="Render JSON output")

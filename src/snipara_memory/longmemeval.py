@@ -315,7 +315,7 @@ class LmStudioFactExtractor:
     api_key: str = "lm-studio"
     prompt_version: str = LM_STUDIO_DEFAULT_PROMPT_VERSION
     temperature: float = 0.0
-    max_tokens: int = 1024
+    max_tokens: int = 2048
     timeout_seconds: float = 120.0
     retries: int = 2
 
