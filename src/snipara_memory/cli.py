@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 import uvicorn
@@ -21,7 +22,7 @@ from .benchmark import (
 )
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
-from .longmemeval import HeuristicFactExtractor
+from .longmemeval import HeuristicFactExtractor, LmStudioFactExtractor
 from .mcp_server import run_stdio_server
 
 
@@ -93,6 +94,36 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval.add_argument(
         "--limit", type=int, default=50, help="Maximum number of questions to ingest"
     )
+    longmemeval.add_argument(
+        "--extractor",
+        choices=("heuristic", "lm-studio"),
+        default="heuristic",
+        help="Fact extractor implementation",
+    )
+    longmemeval.add_argument(
+        "--model",
+        default=os.getenv("LM_STUDIO_MODEL"),
+        help="LM Studio model identifier (or LM_STUDIO_MODEL)",
+    )
+    longmemeval.add_argument(
+        "--base-url",
+        default=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
+        help="LM Studio OpenAI-compatible base URL",
+    )
+    longmemeval.add_argument(
+        "--api-key",
+        default=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
+        help="Local API key value, if configured",
+    )
+    longmemeval.add_argument(
+        "--prompt-version",
+        default="lmstudio-fact-extractor-v1",
+        help="Cache-busting extraction prompt version",
+    )
+    longmemeval.add_argument("--temperature", type=float, default=0.0)
+    longmemeval.add_argument("--max-tokens", type=int, default=1024)
+    longmemeval.add_argument("--timeout", type=float, default=120.0)
+    longmemeval.add_argument("--retries", type=int, default=2)
     longmemeval.add_argument("--json", action="store_true", help="Render JSON output")
 
     mcp = subparsers.add_parser("mcp", help="Run the MCP stdio server")
@@ -226,7 +257,7 @@ async def _run_benchmark(args: argparse.Namespace) -> None:
 async def _run_longmemeval_ingest(args: argparse.Namespace) -> None:
     report = await run_longmemeval_ingestion(
         args.dataset,
-        HeuristicFactExtractor(),
+        _build_longmemeval_extractor(args),
         cache_path=args.cache,
         limit=args.limit,
     )
@@ -234,4 +265,21 @@ async def _run_longmemeval_ingest(args: argparse.Namespace) -> None:
         longmemeval_ingestion_report_as_json(report)
         if args.json
         else render_longmemeval_ingestion_report(report)
+    )
+
+
+def _build_longmemeval_extractor(args: argparse.Namespace):
+    if args.extractor == "heuristic":
+        return HeuristicFactExtractor()
+    if not args.model:
+        raise SystemExit("LM Studio extractor requires --model or LM_STUDIO_MODEL.")
+    return LmStudioFactExtractor(
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        prompt_version=args.prompt_version,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
     )

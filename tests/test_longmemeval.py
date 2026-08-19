@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+from typing import Any, Iterator
 
 from snipara_memory import (
     ExtractedFact,
     ExtractionCache,
     InMemoryMemoryStore,
+    LmStudioFactExtractor,
     MemoryService,
     MemoryStatus,
     MemoryType,
+    LongMemEvalSession,
+    LongMemEvalTurn,
     ingest_longmemeval_dataset,
     load_longmemeval_instances,
 )
@@ -146,3 +152,104 @@ async def test_ingestion_graveyards_superseded_facts_and_keeps_provenance(
 def questions_hash(dataset: Path, index: int) -> str:
     question = load_longmemeval_instances(dataset)[index]
     return question.sessions[0].content_hash
+
+
+@contextmanager
+def _json_server(response_payload: dict[str, Any]) -> Iterator[ThreadingHTTPServer]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"] or 0)
+            body = self.rfile.read(length)
+            self.server.requests.append(json.loads(body))
+            response = json.dumps(response_payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.requests = []
+    thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+async def test_lm_studio_extractor_uses_structured_output_without_ground_truth() -> (
+    None
+):
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "facts": [
+                                {
+                                    "content": "The user prefers Zurich.",
+                                    "title": "City preference",
+                                    "memory_type": "PREFERENCE",
+                                    "confidence": 0.91,
+                                    "fact_key": "user.city",
+                                    "supersedes_fact_key": None,
+                                    "source_turn_indices": [0],
+                                    "tags": ["profile"],
+                                }
+                            ]
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    session = LongMemEvalSession(
+        session_id="session-1",
+        date="2024-06-01",
+        turns=(
+            LongMemEvalTurn(
+                role="user",
+                content="I prefer Zurich.",
+                has_answer=True,
+            ),
+        ),
+    )
+
+    with _json_server(response) as server:
+        extractor = LmStudioFactExtractor(
+            model="local-test-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            retries=0,
+        )
+        facts = await extractor.extract(session)
+
+        assert len(facts) == 1
+        assert facts[0].content == "The user prefers Zurich."
+        assert facts[0].memory_type is MemoryType.PREFERENCE
+        assert len(server.requests) == 1
+        payload = server.requests[0]
+        assert payload["model"] == "local-test-model"
+        assert payload["response_format"]["type"] == "json_schema"
+        user_prompt = payload["messages"][1]["content"]
+        assert "has_answer" not in user_prompt
+        assert "I prefer Zurich." in user_prompt
+
+
+def test_lm_studio_version_changes_when_model_or_prompt_changes() -> None:
+    base = LmStudioFactExtractor(model="model-a")
+
+    assert base.version == "model-a:lmstudio-fact-extractor-v1"
+    assert LmStudioFactExtractor(model="model-b").version != base.version
+    assert (
+        LmStudioFactExtractor(
+            model="model-a", prompt_version="lmstudio-fact-extractor-v2"
+        ).version
+        != base.version
+    )

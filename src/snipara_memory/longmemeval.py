@@ -7,6 +7,7 @@ decision explicit while leaving the extraction model behind a small protocol.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -14,6 +15,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .domain import (
     GraveyardReason,
@@ -27,6 +30,75 @@ from .importers import TranscriptMessage, extract_transcript_requests
 
 LONGMEMEVAL_CACHE_SCHEMA = "snipara.longmemeval.extraction-cache.v1"
 LONGMEMEVAL_SOURCE = "longmemeval-cleaned"
+LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
+LM_STUDIO_DEFAULT_PROMPT_VERSION = "lmstudio-fact-extractor-v1"
+LM_STUDIO_SYSTEM_PROMPT = """You extract durable personal facts from one timestamped chat session.
+
+Return only facts that are useful for answering future questions: stable user
+facts, preferences, decisions, plans, or explicit updates. Do not copy the raw
+transcript, do not infer facts that are not stated, and do not use any question
+or answer outside this session.
+
+Assign a stable semantic fact_key when a fact can be updated later, such as
+user.home_city. If this session updates an earlier fact, set
+supersedes_fact_key to the earlier key. Use null when no stable key is safe.
+source_turn_indices must refer to the zero-based turn indexes in the supplied
+session. Use uppercase memory_type values: FACT, DECISION, LEARNING,
+PREFERENCE, TODO, or CONTEXT. Return an empty facts array when nothing durable
+is present.
+"""
+LM_STUDIO_FACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["facts"],
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "content",
+                    "title",
+                    "memory_type",
+                    "confidence",
+                    "fact_key",
+                    "supersedes_fact_key",
+                    "source_turn_indices",
+                    "tags",
+                ],
+                "properties": {
+                    "content": {"type": "string", "minLength": 1},
+                    "title": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "memory_type": {
+                        "type": "string",
+                        "enum": [
+                            "FACT",
+                            "DECISION",
+                            "LEARNING",
+                            "PREFERENCE",
+                            "TODO",
+                            "CONTEXT",
+                        ],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "fact_key": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "supersedes_fact_key": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                    "source_turn_indices": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0},
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
+        }
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +300,156 @@ class FactExtractor(Protocol):
     async def extract(
         self, session: LongMemEvalSession
     ) -> Sequence[ExtractedFact | Mapping[str, Any]]: ...
+
+
+class _LmStudioRequestError(OSError):
+    """Retryable local transport failure."""
+
+
+@dataclass(slots=True)
+class LmStudioFactExtractor:
+    """Extract facts through LM Studio's OpenAI-compatible local API."""
+
+    model: str
+    base_url: str = LM_STUDIO_DEFAULT_BASE_URL
+    api_key: str = "lm-studio"
+    prompt_version: str = LM_STUDIO_DEFAULT_PROMPT_VERSION
+    temperature: float = 0.0
+    max_tokens: int = 1024
+    timeout_seconds: float = 120.0
+    retries: int = 2
+
+    def __post_init__(self) -> None:
+        self.model = self.model.strip()
+        self.base_url = self.base_url.rstrip("/")
+        if not self.model:
+            raise ValueError("LM Studio extractor requires a model identifier")
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ValueError("LM Studio base_url must start with http:// or https://")
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if self.retries < 0:
+            raise ValueError("retries cannot be negative")
+
+    @property
+    def version(self) -> str:
+        """Cache identity for the model and the extraction prompt contract."""
+
+        return f"{self.model}:{self.prompt_version}"
+
+    async def extract(self, session: LongMemEvalSession) -> Sequence[ExtractedFact]:
+        payload = self._build_payload(session)
+        for attempt in range(self.retries + 1):
+            try:
+                response = await asyncio.to_thread(self._post_json, payload)
+            except _LmStudioRequestError as error:
+                if attempt >= self.retries:
+                    raise RuntimeError(
+                        f"LM Studio request failed after {attempt + 1} attempts: {error}"
+                    ) from error
+                await asyncio.sleep(min(2**attempt, 8))
+                continue
+            return _facts_from_lm_studio_response(response)
+        raise AssertionError("LM Studio retry loop exited unexpectedly")
+
+    def _build_payload(self, session: LongMemEvalSession) -> dict[str, Any]:
+        # Deliberately omit LongMemEval's `has_answer` labels: they are ground
+        # truth for evaluation and must never leak into the extraction prompt.
+        session_payload = {
+            "session_id": session.session_id,
+            "session_date": session.date,
+            "turns": [
+                {"role": turn.role, "content": turn.content} for turn in session.turns
+            ],
+        }
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": LM_STUDIO_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        session_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "longmemeval_facts",
+                    "strict": True,
+                    "schema": LM_STUDIO_FACT_SCHEMA,
+                },
+            },
+        }
+
+    def _post_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise _LmStudioRequestError(
+                f"HTTP {error.code} from {self.base_url}: {detail}"
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise _LmStudioRequestError(
+                f"Could not reach {self.base_url}: {error}"
+            ) from error
+        if not isinstance(decoded, Mapping):
+            raise _LmStudioRequestError("LM Studio returned a non-object response")
+        return decoded
+
+
+def _facts_from_lm_studio_response(
+    response: Mapping[str, Any],
+) -> list[ExtractedFact]:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("LM Studio response has no choices")
+    first_choice = choices[0]
+    if not isinstance(first_choice, Mapping):
+        raise ValueError("LM Studio response choice is not an object")
+    message = first_choice.get("message")
+    if not isinstance(message, Mapping) or not isinstance(message.get("content"), str):
+        raise ValueError("LM Studio response choice has no text content")
+
+    content = message["content"].strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        lines = lines[1:] if lines and lines[0].startswith("```") else lines
+        lines = lines[:-1] if lines and lines[-1].strip() == "```" else lines
+        content = "\n".join(lines).strip()
+    decoded = json.loads(content)
+    if isinstance(decoded, list):
+        raw_facts = decoded
+    elif isinstance(decoded, Mapping):
+        raw_facts = decoded.get("facts")
+    else:
+        raw_facts = None
+    if not isinstance(raw_facts, list):
+        raise ValueError("LM Studio response must contain a facts array")
+    try:
+        return [ExtractedFact.from_mapping(fact) for fact in raw_facts]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"LM Studio returned an invalid fact: {error}") from error
 
 
 class HeuristicFactExtractor:

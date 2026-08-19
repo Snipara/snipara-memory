@@ -88,6 +88,36 @@ The package includes `HeuristicFactExtractor` only as a dependency-free smoke
 test. It is not the production LongMemEval configuration; a real run should
 provide an LLM-backed `FactExtractor` and keep the reader/judge stage separate.
 
+### Local LM Studio extractor
+
+The adapter includes an LM Studio implementation using its OpenAI-compatible
+local server. Start the server from LM Studio's Developer tab (or with
+`lms server start`), load the model you want to evaluate, then run a small
+subset first:
+
+```bash
+export LM_STUDIO_MODEL="your-loaded-model-id"
+snipara-memory longmemeval-ingest \
+  /path/to/longmemeval_s_cleaned.json \
+  --extractor lm-studio \
+  --model "$LM_STUDIO_MODEL" \
+  --limit 50 \
+  --cache .cache/longmemeval-lmstudio.json \
+  --json
+```
+
+The client uses only Python's standard library; no OpenAI SDK dependency is
+required. It requests a strict JSON schema containing facts, stable fact keys,
+and supersession keys. The dataset's `has_answer` evaluation labels are
+deliberately omitted from the model input. `--prompt-version` and the model
+identifier are part of the cache key, so changing either starts a fresh
+extraction pass while preserving the previous cache for comparison.
+
+The first pass is compute-bound and can take a long time on a local model.
+Replay the same command to use the cache, and do not interpret this ingestion
+step as the final LongMemEval score: retrieval, reader generation, and the
+official LLM judge remain a separate QA layer.
+
 Run a 30–50 question ingestion dry-run after downloading the dataset locally:
 
 ```bash
