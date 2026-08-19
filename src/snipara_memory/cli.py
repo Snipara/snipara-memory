@@ -11,13 +11,29 @@ import uvicorn
 
 from . import __version__, create_app
 from .adapters import InMemoryMemoryStore, JsonFileMemoryStore, get_default_store_path
-from .benchmark import benchmark_report_as_json, render_benchmark_report, run_benchmark
+from .benchmark import (
+    benchmark_report_as_json,
+    longmemeval_ingestion_report_as_json,
+    render_benchmark_report,
+    render_longmemeval_ingestion_report,
+    run_benchmark,
+    run_longmemeval_ingestion,
+)
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
+from .longmemeval import HeuristicFactExtractor
 from .mcp_server import run_stdio_server
 
 
-COMMANDS = {"serve", "import-transcript", "import-project", "benchmark", "mcp", "version"}
+COMMANDS = {
+    "serve",
+    "import-transcript",
+    "import-project",
+    "benchmark",
+    "longmemeval-ingest",
+    "mcp",
+    "version",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,10 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_store_options(import_transcript_cmd)
     import_transcript_cmd.add_argument("path", help="Transcript file path")
-    import_transcript_cmd.add_argument("--namespace", required=True, help="Namespace ID")
+    import_transcript_cmd.add_argument(
+        "--namespace", required=True, help="Namespace ID"
+    )
     import_transcript_cmd.add_argument("--source", help="Override source label")
-    import_transcript_cmd.add_argument("--max-items", type=int, help="Maximum imported memories")
-    import_transcript_cmd.add_argument("--json", action="store_true", help="Render JSON output")
+    import_transcript_cmd.add_argument(
+        "--max-items", type=int, help="Maximum imported memories"
+    )
+    import_transcript_cmd.add_argument(
+        "--json", action="store_true", help="Render JSON output"
+    )
 
     import_project_cmd = subparsers.add_parser(
         "import-project",
@@ -48,8 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_store_options(import_project_cmd)
     import_project_cmd.add_argument("path", help="Project file or directory path")
     import_project_cmd.add_argument("--namespace", required=True, help="Namespace ID")
-    import_project_cmd.add_argument("--max-items", type=int, help="Maximum imported memories")
-    import_project_cmd.add_argument("--json", action="store_true", help="Render JSON output")
+    import_project_cmd.add_argument(
+        "--max-items", type=int, help="Maximum imported memories"
+    )
+    import_project_cmd.add_argument(
+        "--json", action="store_true", help="Render JSON output"
+    )
 
     benchmark = subparsers.add_parser(
         "benchmark",
@@ -57,6 +83,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument("dataset", help="Path to benchmark dataset (json/jsonl)")
     benchmark.add_argument("--json", action="store_true", help="Render JSON output")
+
+    longmemeval = subparsers.add_parser(
+        "longmemeval-ingest",
+        help="Ingest a LongMemEval subset as extracted memories",
+    )
+    longmemeval.add_argument("dataset", help="Path to LongMemEval JSON/JSONL dataset")
+    longmemeval.add_argument("--cache", help="JSON extraction cache path")
+    longmemeval.add_argument(
+        "--limit", type=int, default=50, help="Maximum number of questions to ingest"
+    )
+    longmemeval.add_argument("--json", action="store_true", help="Render JSON output")
 
     mcp = subparsers.add_parser("mcp", help="Run the MCP stdio server")
     _add_store_options(mcp)
@@ -84,8 +121,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "benchmark":
         asyncio.run(_run_benchmark(args))
         return
+    if args.command == "longmemeval-ingest":
+        asyncio.run(_run_longmemeval_ingest(args))
+        return
     if args.command == "mcp":
-        asyncio.run(run_stdio_server(store_path=args.store_path, in_memory=args.in_memory))
+        asyncio.run(
+            run_stdio_server(store_path=args.store_path, in_memory=args.in_memory)
+        )
         return
     if args.command == "version":
         print(f"snipara-memory {__version__}")
@@ -108,7 +150,11 @@ def _add_store_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_service(args: argparse.Namespace) -> MemoryService:
-    store = InMemoryMemoryStore() if args.in_memory else JsonFileMemoryStore(args.store_path)
+    store = (
+        InMemoryMemoryStore()
+        if args.in_memory
+        else JsonFileMemoryStore(args.store_path)
+    )
     return MemoryService(store=store)
 
 
@@ -126,11 +172,16 @@ async def _run_transcript_import(args: argparse.Namespace) -> None:
         max_items=args.max_items,
     )
     if args.json:
-        print(json.dumps({
-            "scanned_items": result.scanned_items,
-            "imported_candidates": result.imported_candidates,
-            "skipped_items": result.skipped_items,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "scanned_items": result.scanned_items,
+                    "imported_candidates": result.imported_candidates,
+                    "skipped_items": result.skipped_items,
+                },
+                indent=2,
+            )
+        )
         return
     print(
         f"Imported {result.imported_candidates} durable memories from "
@@ -146,11 +197,16 @@ async def _run_project_import(args: argparse.Namespace) -> None:
         max_items=args.max_items,
     )
     if args.json:
-        print(json.dumps({
-            "scanned_items": result.scanned_items,
-            "imported_candidates": result.imported_candidates,
-            "skipped_items": result.skipped_items,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "scanned_items": result.scanned_items,
+                    "imported_candidates": result.imported_candidates,
+                    "skipped_items": result.skipped_items,
+                },
+                indent=2,
+            )
+        )
         return
     print(
         f"Imported {result.imported_candidates} durable memories from "
@@ -160,4 +216,22 @@ async def _run_project_import(args: argparse.Namespace) -> None:
 
 async def _run_benchmark(args: argparse.Namespace) -> None:
     report = await run_benchmark(args.dataset)
-    print(benchmark_report_as_json(report) if args.json else render_benchmark_report(report))
+    print(
+        benchmark_report_as_json(report)
+        if args.json
+        else render_benchmark_report(report)
+    )
+
+
+async def _run_longmemeval_ingest(args: argparse.Namespace) -> None:
+    report = await run_longmemeval_ingestion(
+        args.dataset,
+        HeuristicFactExtractor(),
+        cache_path=args.cache,
+        limit=args.limit,
+    )
+    print(
+        longmemeval_ingestion_report_as_json(report)
+        if args.json
+        else render_longmemeval_ingestion_report(report)
+    )

@@ -8,7 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import InMemoryMemoryStore
-from .domain import MemoryScope, MemoryService, MemoryType, RecallQuery, StoreMemoryRequest
+from .domain import (
+    MemoryScope,
+    MemoryService,
+    MemoryType,
+    RecallQuery,
+    StoreMemoryRequest,
+)
+from .longmemeval import (
+    FactExtractor,
+    LongMemEvalIngestionReport,
+    ingest_longmemeval_dataset,
+)
 
 
 @dataclass(slots=True)
@@ -40,7 +51,9 @@ class BenchmarkReport:
     cases: list[BenchmarkCaseResult]
 
 
-async def run_benchmark(dataset_path: str | Path, *, default_limit: int = 5) -> BenchmarkReport:
+async def run_benchmark(
+    dataset_path: str | Path, *, default_limit: int = 5
+) -> BenchmarkReport:
     dataset = Path(dataset_path)
     cases = load_benchmark_cases(dataset)
     results: list[BenchmarkCaseResult] = []
@@ -54,9 +67,7 @@ async def run_benchmark(dataset_path: str | Path, *, default_limit: int = 5) -> 
             ]
         )
         relevant_memory_ids = {
-            created[index].id
-            for index in case.relevant_indices
-            if index < len(created)
+            created[index].id for index in case.relevant_indices if index < len(created)
         }
         relevant_titles = [
             created[index].title or created[index].content
@@ -71,9 +82,15 @@ async def run_benchmark(dataset_path: str | Path, *, default_limit: int = 5) -> 
             )
         )
         returned_ids = [match.memory.id for match in matches]
-        returned_titles = [match.memory.title or match.memory.content for match in matches]
+        returned_titles = [
+            match.memory.title or match.memory.content for match in matches
+        ]
         rank = next(
-            (index + 1 for index, memory_id in enumerate(returned_ids) if memory_id in relevant_memory_ids),
+            (
+                index + 1
+                for index, memory_id in enumerate(returned_ids)
+                if memory_id in relevant_memory_ids
+            ),
             None,
         )
         results.append(
@@ -87,9 +104,21 @@ async def run_benchmark(dataset_path: str | Path, *, default_limit: int = 5) -> 
         )
 
     case_count = len(results)
-    recall_at_k = sum(1 for result in results if result.hit_at_k) / case_count if case_count else 0.0
-    mrr = sum(result.reciprocal_rank for result in results) / case_count if case_count else 0.0
-    top1 = sum(1 for result in results if result.reciprocal_rank == 1.0) / case_count if case_count else 0.0
+    recall_at_k = (
+        sum(1 for result in results if result.hit_at_k) / case_count
+        if case_count
+        else 0.0
+    )
+    mrr = (
+        sum(result.reciprocal_rank for result in results) / case_count
+        if case_count
+        else 0.0
+    )
+    top1 = (
+        sum(1 for result in results if result.reciprocal_rank == 1.0) / case_count
+        if case_count
+        else 0.0
+    )
     return BenchmarkReport(
         dataset=str(dataset),
         case_count=case_count,
@@ -97,6 +126,30 @@ async def run_benchmark(dataset_path: str | Path, *, default_limit: int = 5) -> 
         mean_reciprocal_rank=mrr,
         top1_accuracy=top1,
         cases=results,
+    )
+
+
+async def run_longmemeval_ingestion(
+    dataset_path: str | Path,
+    extractor: FactExtractor,
+    *,
+    cache_path: str | Path | None = None,
+    limit: int | None = 50,
+) -> LongMemEvalIngestionReport:
+    """Run the fact-ingestion stage against a bounded LongMemEval subset.
+
+    This deliberately stops before reader and LLM judge scoring. Keeping the
+    stage separate makes extraction cost and cache behavior visible instead of
+    hiding them inside the existing recall@k smoke-test report.
+    """
+
+    service = MemoryService(store=InMemoryMemoryStore())
+    return await ingest_longmemeval_dataset(
+        service,
+        dataset_path,
+        extractor,
+        cache_path=cache_path,
+        limit=limit,
     )
 
 
@@ -111,12 +164,48 @@ def render_benchmark_report(report: BenchmarkReport) -> str:
     ]
     for case in report.cases:
         status = "hit" if case.hit_at_k else "miss"
-        lines.append(f"- {case.case_id}: {status} | relevant={case.relevant_titles} | returned={case.returned_titles[:3]}")
+        lines.append(
+            f"- {case.case_id}: {status} | relevant={case.relevant_titles} | returned={case.returned_titles[:3]}"
+        )
     return "\n".join(lines)
 
 
 def benchmark_report_as_json(report: BenchmarkReport) -> str:
     return json.dumps(asdict(report), indent=2, sort_keys=True)
+
+
+def longmemeval_ingestion_report_as_json(report: LongMemEvalIngestionReport) -> str:
+    payload = {
+        "dataset": report.dataset,
+        "question_count": report.question_count,
+        "session_count": report.session_count,
+        "extracted_fact_count": report.extracted_fact_count,
+        "cache_hits": report.cache_hits,
+        "cache_misses": report.cache_misses,
+        "questions": [
+            {
+                "question_id": question.question_id,
+                "session_count": question.session_count,
+                "extracted_fact_count": question.extracted_fact_count,
+                "cache_hits": question.cache_hits,
+                "cache_misses": question.cache_misses,
+                "superseded_count": len(question.superseded_memory_ids),
+            }
+            for question in report.questions
+        ],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def render_longmemeval_ingestion_report(report: LongMemEvalIngestionReport) -> str:
+    return (
+        f"Dataset: {report.dataset}\n"
+        f"Questions: {report.question_count}\n"
+        f"Sessions: {report.session_count}\n"
+        f"Extracted facts: {report.extracted_fact_count}\n"
+        f"Cache hits: {report.cache_hits}\n"
+        f"Cache misses: {report.cache_misses}"
+    )
 
 
 def load_benchmark_cases(dataset_path: str | Path) -> list[BenchmarkCase]:
@@ -136,7 +225,9 @@ def load_benchmark_cases(dataset_path: str | Path) -> list[BenchmarkCase]:
     raise ValueError(f"Unsupported benchmark dataset format: {dataset}")
 
 
-def _request_from_setup_item(item: dict[str, Any], *, namespace_id: str) -> StoreMemoryRequest:
+def _request_from_setup_item(
+    item: dict[str, Any], *, namespace_id: str
+) -> StoreMemoryRequest:
     memory_type = MemoryType(item.get("memory_type", MemoryType.FACT.value))
     return StoreMemoryRequest(
         namespace_id=namespace_id,

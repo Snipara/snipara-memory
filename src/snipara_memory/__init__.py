@@ -28,6 +28,20 @@ from .domain import (
     classify_memory_tier,
 )
 from .ports import CacheStore, EmbeddingsProvider, MemoryStore
+from .longmemeval import (
+    ExtractedFact,
+    ExtractionCache,
+    FactExtractor,
+    HeuristicFactExtractor,
+    LongMemEvalIngestionReport,
+    LongMemEvalIngestionResult,
+    LongMemEvalQuestion,
+    LongMemEvalSession,
+    LongMemEvalTurn,
+    ingest_longmemeval_dataset,
+    ingest_longmemeval_question,
+    load_longmemeval_instances,
+)
 
 try:
     __version__ = version("snipara-memory")
@@ -41,7 +55,11 @@ __all__ = [
     "ContradictionResolution",
     "ContradictionStatus",
     "EmbeddingsProvider",
+    "ExtractedFact",
+    "ExtractionCache",
+    "FactExtractor",
     "GraveyardEntry",
+    "HeuristicFactExtractor",
     "GraveyardReason",
     "InMemoryMemoryStore",
     "JsonFileMemoryStore",
@@ -52,6 +70,11 @@ __all__ = [
     "MemoryStore",
     "MemoryTier",
     "MemoryType",
+    "LongMemEvalIngestionReport",
+    "LongMemEvalIngestionResult",
+    "LongMemEvalQuestion",
+    "LongMemEvalSession",
+    "LongMemEvalTurn",
     "Namespace",
     "NamespaceType",
     "RecallMatch",
@@ -64,4 +87,7 @@ __all__ = [
     "classify_memory_tier",
     "create_app",
     "get_default_store_path",
+    "ingest_longmemeval_dataset",
+    "ingest_longmemeval_question",
+    "load_longmemeval_instances",
 ]

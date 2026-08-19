@@ -67,3 +67,46 @@ It is **not** yet a competitive long-context benchmark suite.
 
 When a broader benchmark is added, it should remain reproducible from this repo
 with committed fixtures or clearly documented download steps.
+
+## LongMemEval ingestion adapter
+
+The first step toward a real external benchmark is now available as an
+ingestion adapter. It intentionally indexes extracted facts, not raw chat
+turns:
+
+- raw sessions are parsed only in memory and retained in memory metadata as
+  session/turn provenance;
+- an extractor implements the `FactExtractor` protocol and returns
+  `ExtractedFact` objects;
+- `fact_key` and `supersedes_fact_key` let the adapter exercise the memory
+  graveyard instead of appending every update forever;
+- extraction results are cached by question/session, session content hash, and
+  extractor version, so changing the extraction prompt is an explicit cache
+  invalidation event.
+
+The package includes `HeuristicFactExtractor` only as a dependency-free smoke
+test. It is not the production LongMemEval configuration; a real run should
+provide an LLM-backed `FactExtractor` and keep the reader/judge stage separate.
+
+Run a 30–50 question ingestion dry-run after downloading the dataset locally:
+
+```bash
+snipara-memory longmemeval-ingest \
+  /path/to/longmemeval_s_cleaned.json \
+  --limit 50 \
+  --cache .cache/longmemeval-extractions.json \
+  --json
+```
+
+No LongMemEval payload is committed to this repository. The upstream code
+repository reports an MIT license, and the `longmemeval-cleaned` dataset card
+also declares MIT; re-check both sources before publishing benchmark outputs or
+redistributing data:
+
+- [upstream LongMemEval repository](https://github.com/xiaowu0162/LongMemEval)
+- [upstream repository license](https://github.com/xiaowu0162/LongMemEval/blob/main/LICENSE)
+- [cleaned dataset card](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)
+
+The official QA judge prompts remain upstream-owned plumbing for the next
+benchmark phase. This adapter alone measures ingestion mechanics and should not
+be presented as a LongMemEval answer-accuracy score.
