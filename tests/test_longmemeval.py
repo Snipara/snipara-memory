@@ -151,6 +151,38 @@ async def test_ingestion_graveyards_superseded_facts_and_keeps_provenance(
     assert result.superseded_memory_ids == (result.stored_memory_ids[0],)
 
 
+async def test_ingestion_handles_repeated_supersession_without_crashing(
+    tmp_path: Path,
+) -> None:
+    payload = _question_payload()
+    payload["haystack_session_ids"] = ["session-1", "session-2", "session-3"]
+    payload["haystack_dates"] = ["2024-01-01", "2024-05-01", "2024-06-01"]
+    payload["haystack_sessions"] = [
+        *payload["haystack_sessions"],
+        [{"role": "user", "content": "I still live in Zurich."}],
+    ]
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([payload]), encoding="utf-8")
+    store = InMemoryMemoryStore()
+
+    report = await ingest_longmemeval_dataset(
+        MemoryService(store),
+        dataset,
+        CountingExtractor(),
+    )
+
+    result = report.questions[0]
+    assert result.superseded_memory_ids == (
+        result.stored_memory_ids[0],
+        result.stored_memory_ids[1],
+    )
+    active = await store.list_memories(
+        "longmemeval:q-1", statuses=[MemoryStatus.ACTIVE]
+    )
+    assert len(active) == 1
+    assert active[0].content == "The user now lives in Zurich."
+
+
 async def test_ingestion_flushes_extraction_cache_after_each_session(
     tmp_path: Path,
 ) -> None:

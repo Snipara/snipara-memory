@@ -808,15 +808,22 @@ async def ingest_longmemeval_question(
     for memory in created:
         supersedes_key = memory.metadata.get("supersedes_fact_key")
         if supersedes_key:
-            previous = current_by_fact_key.get(str(supersedes_key))
+            supersedes_key = str(supersedes_key)
+            previous = current_by_fact_key.get(supersedes_key)
             if previous is not None and previous.id != memory.id:
-                await service.move_to_graveyard(
-                    previous.id,
-                    reason=GraveyardReason.SUPERSEDED,
-                    replaced_by_id=memory.id,
-                    restore_hint="Re-run the LongMemEval extractor if the newer fact is incorrect.",
-                )
-                superseded_ids.append(previous.id)
+                try:
+                    await service.move_to_graveyard(
+                        previous.id,
+                        reason=GraveyardReason.SUPERSEDED,
+                        replaced_by_id=memory.id,
+                        restore_hint="Re-run the LongMemEval extractor if the newer fact is incorrect.",
+                    )
+                except ValueError as error:
+                    if "already in graveyard" not in str(error):
+                        raise
+                else:
+                    superseded_ids.append(previous.id)
+                current_by_fact_key[supersedes_key] = memory
         fact_key = memory.metadata.get("fact_key")
         if fact_key:
             current_by_fact_key[str(fact_key)] = memory
