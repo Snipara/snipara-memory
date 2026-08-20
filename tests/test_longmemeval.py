@@ -7,8 +7,6 @@ from pathlib import Path
 import threading
 from typing import Any, Iterator
 
-import pytest
-
 from snipara_memory import (
     ExtractedFact,
     ExtractionCache,
@@ -168,14 +166,17 @@ async def test_ingestion_flushes_extraction_cache_after_each_session(
                 raise RuntimeError("synthetic extraction failure")
             return [ExtractedFact(content="The user lives in Paris.")]
 
-    with pytest.raises(RuntimeError, match="synthetic extraction failure"):
-        await ingest_longmemeval_dataset(
-            MemoryService(InMemoryMemoryStore()),
-            dataset,
-            FailOnSecondSession(),
-            cache_path=cache_path,
-        )
+    report = await ingest_longmemeval_dataset(
+        MemoryService(InMemoryMemoryStore()),
+        dataset,
+        FailOnSecondSession(),
+        cache_path=cache_path,
+    )
 
+    result = report.questions[0]
+    assert report.failed_session_count == 1
+    assert result.failed_session_ids == ("session-2",)
+    assert "synthetic extraction failure" in result.failure_messages[0]
     cached = ExtractionCache(cache_path).get(
         "q-1:session-1",
         session_hash=questions_hash(dataset, 0),

@@ -121,6 +121,11 @@ before the truncation are retained and marked in metadata. For
 reasoning-capable local models such as gpt-oss, `--reasoning-effort low` keeps
 extraction latency bounded while preserving structured output.
 
+An individual session that still returns invalid output after all retries is
+recorded in the report as a failed session and skipped so the bounded run can
+continue. Its cache entry is left absent, which makes the next replay retry
+that session instead of silently treating it as successfully extracted.
+
 The first pass is compute-bound and can take a long time on a local model.
 Replay the same command to use the cache, and do not interpret this ingestion
 step as the final LongMemEval score: retrieval, reader generation, and the

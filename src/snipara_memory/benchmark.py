@@ -182,6 +182,7 @@ def longmemeval_ingestion_report_as_json(report: LongMemEvalIngestionReport) -> 
         "extracted_fact_count": report.extracted_fact_count,
         "cache_hits": report.cache_hits,
         "cache_misses": report.cache_misses,
+        "failed_session_count": report.failed_session_count,
         "questions": [
             {
                 "question_id": question.question_id,
@@ -189,6 +190,8 @@ def longmemeval_ingestion_report_as_json(report: LongMemEvalIngestionReport) -> 
                 "extracted_fact_count": question.extracted_fact_count,
                 "cache_hits": question.cache_hits,
                 "cache_misses": question.cache_misses,
+                "failed_session_ids": list(question.failed_session_ids),
+                "failure_messages": list(question.failure_messages),
                 "superseded_count": len(question.superseded_memory_ids),
             }
             for question in report.questions
@@ -204,7 +207,8 @@ def render_longmemeval_ingestion_report(report: LongMemEvalIngestionReport) -> s
         f"Sessions: {report.session_count}\n"
         f"Extracted facts: {report.extracted_fact_count}\n"
         f"Cache hits: {report.cache_hits}\n"
-        f"Cache misses: {report.cache_misses}"
+        f"Cache misses: {report.cache_misses}\n"
+        f"Failed sessions: {report.failed_session_count}"
     )
 
 

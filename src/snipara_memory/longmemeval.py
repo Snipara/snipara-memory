@@ -679,6 +679,8 @@ class LongMemEvalIngestionResult:
     extracted_fact_count: int
     stored_memory_ids: tuple[str, ...]
     superseded_memory_ids: tuple[str, ...]
+    failed_session_ids: tuple[str, ...] = ()
+    failure_messages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,6 +692,7 @@ class LongMemEvalIngestionReport:
     cache_hits: int
     cache_misses: int
     questions: tuple[LongMemEvalIngestionResult, ...]
+    failed_session_count: int
 
 
 async def ingest_longmemeval_question(
@@ -707,6 +710,8 @@ async def ingest_longmemeval_question(
     requests: list[StoreMemoryRequest] = []
     cache_hits = 0
     cache_misses = 0
+    failed_session_ids: list[str] = []
+    failure_messages: list[str] = []
 
     for session in question.sessions:
         cache_key = f"{question.question_id}:{session.session_id}"
@@ -720,16 +725,23 @@ async def ingest_longmemeval_question(
             else None
         )
         if facts is None:
-            raw_facts = extractor.extract(session)
-            if inspect.isawaitable(raw_facts):
-                raw_facts = await raw_facts
-            facts = [
-                fact
-                if isinstance(fact, ExtractedFact)
-                else ExtractedFact.from_mapping(fact)
-                for fact in raw_facts
-            ]
             cache_misses += 1
+            try:
+                raw_facts = extractor.extract(session)
+                if inspect.isawaitable(raw_facts):
+                    raw_facts = await raw_facts
+                facts = [
+                    fact
+                    if isinstance(fact, ExtractedFact)
+                    else ExtractedFact.from_mapping(fact)
+                    for fact in raw_facts
+                ]
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
+                failed_session_ids.append(session.session_id)
+                failure_messages.append(
+                    f"{session.session_id}: {type(error).__name__}: {str(error)[:500]}"
+                )
+                continue
             if cache:
                 cache.put(
                     cache_key,
@@ -821,6 +833,8 @@ async def ingest_longmemeval_question(
         extracted_fact_count=len(requests),
         stored_memory_ids=tuple(memory.id for memory in created),
         superseded_memory_ids=tuple(superseded_ids),
+        failed_session_ids=tuple(failed_session_ids),
+        failure_messages=tuple(failure_messages),
     )
 
 
@@ -853,6 +867,7 @@ async def ingest_longmemeval_dataset(
         cache_hits=sum(result.cache_hits for result in results),
         cache_misses=sum(result.cache_misses for result in results),
         questions=results,
+        failed_session_count=sum(len(result.failed_session_ids) for result in results),
     )
 
 
