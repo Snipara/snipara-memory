@@ -641,6 +641,24 @@ class ExtractionCache:
         except (KeyError, TypeError, ValueError):
             return None
 
+    def get_failure(
+        self,
+        key: str,
+        *,
+        session_hash: str,
+        extractor_version: str,
+    ) -> str | None:
+        entry = self._entries.get(key)
+        if (
+            not entry
+            or entry.get("session_hash") != session_hash
+            or entry.get("extractor_version") != extractor_version
+            or entry.get("status") != "failed"
+        ):
+            return None
+        error = entry.get("error")
+        return str(error) if error else "cached extraction failure"
+
     def put(
         self,
         key: str,
@@ -653,6 +671,21 @@ class ExtractionCache:
             "session_hash": session_hash,
             "extractor_version": extractor_version,
             "facts": [fact.to_dict() for fact in facts],
+        }
+
+    def put_failure(
+        self,
+        key: str,
+        *,
+        session_hash: str,
+        extractor_version: str,
+        error: str,
+    ) -> None:
+        self._entries[key] = {
+            "session_hash": session_hash,
+            "extractor_version": extractor_version,
+            "status": "failed",
+            "error": error[:500],
         }
 
     def flush(self) -> None:
@@ -715,6 +748,21 @@ async def ingest_longmemeval_question(
 
     for session in question.sessions:
         cache_key = f"{question.question_id}:{session.session_id}"
+        cached_failure = (
+            cache.get_failure(
+                cache_key,
+                session_hash=session.content_hash,
+                extractor_version=extractor_version,
+            )
+            if cache
+            else None
+        )
+        if cached_failure is not None:
+            failed_session_ids.append(session.session_id)
+            failure_messages.append(
+                f"{session.session_id}: cached extraction failure: {cached_failure}"
+            )
+            continue
         facts = (
             cache.get(
                 cache_key,
@@ -738,9 +786,18 @@ async def ingest_longmemeval_question(
                 ]
             except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
                 failed_session_ids.append(session.session_id)
-                failure_messages.append(
+                message = (
                     f"{session.session_id}: {type(error).__name__}: {str(error)[:500]}"
                 )
+                failure_messages.append(message)
+                if cache:
+                    cache.put_failure(
+                        cache_key,
+                        session_hash=session.content_hash,
+                        extractor_version=extractor_version,
+                        error=message,
+                    )
+                    cache.flush()
                 continue
             if cache:
                 cache.put(

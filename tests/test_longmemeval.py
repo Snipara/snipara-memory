@@ -216,6 +216,22 @@ async def test_ingestion_flushes_extraction_cache_after_each_session(
     )
     assert cached is not None
     assert cached[0].content == "The user lives in Paris."
+    question = load_longmemeval_instances(dataset)[0]
+    failure = ExtractionCache(cache_path).get_failure(
+        "q-1:session-2",
+        session_hash=question.sessions[1].content_hash,
+        extractor_version="failing-extractor-v1",
+    )
+    assert failure is not None
+    assert "synthetic extraction failure" in failure
+
+    replay = await ingest_longmemeval_dataset(
+        MemoryService(InMemoryMemoryStore()),
+        dataset,
+        FailOnSecondSession(),
+        cache_path=cache_path,
+    )
+    assert replay.questions[0].failed_session_ids == ("session-2",)
 
 
 def questions_hash(dataset: Path, index: int) -> str:
