@@ -7,6 +7,8 @@ from pathlib import Path
 import threading
 from typing import Any, Iterator
 
+import pytest
+
 from snipara_memory import (
     ExtractedFact,
     ExtractionCache,
@@ -149,6 +151,38 @@ async def test_ingestion_graveyards_superseded_facts_and_keeps_provenance(
     assert new_memory.metadata["source_session_id"] == "session-2"
     assert "answer-session" in new_memory.tags
     assert result.superseded_memory_ids == (result.stored_memory_ids[0],)
+
+
+async def test_ingestion_flushes_extraction_cache_after_each_session(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([_question_payload()]), encoding="utf-8")
+    cache_path = tmp_path / "extractions.json"
+
+    class FailOnSecondSession:
+        version = "failing-extractor-v1"
+
+        async def extract(self, session) -> list[ExtractedFact]:
+            if session.session_id == "session-2":
+                raise RuntimeError("synthetic extraction failure")
+            return [ExtractedFact(content="The user lives in Paris.")]
+
+    with pytest.raises(RuntimeError, match="synthetic extraction failure"):
+        await ingest_longmemeval_dataset(
+            MemoryService(InMemoryMemoryStore()),
+            dataset,
+            FailOnSecondSession(),
+            cache_path=cache_path,
+        )
+
+    cached = ExtractionCache(cache_path).get(
+        "q-1:session-1",
+        session_hash=questions_hash(dataset, 0),
+        extractor_version="failing-extractor-v1",
+    )
+    assert cached is not None
+    assert cached[0].content == "The user lives in Paris."
 
 
 def questions_hash(dataset: Path, index: int) -> str:

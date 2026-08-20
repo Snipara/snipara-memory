@@ -45,7 +45,9 @@ supersedes_fact_key to the earlier key. Use null when no stable key is safe.
 source_turn_indices must refer to the zero-based turn indexes in the supplied
 session. Use uppercase memory_type values: FACT, DECISION, LEARNING,
 PREFERENCE, TODO, or CONTEXT. Return an empty facts array when nothing durable
-is present.
+is present. Extract at most 6 high-value facts. Keep each content and title
+under 160 characters, use at most 5 tags per fact, and return compact JSON
+without commentary.
 """
 LM_STUDIO_FACT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -735,6 +737,7 @@ async def ingest_longmemeval_question(
                     extractor_version=extractor_version,
                     facts=facts,
                 )
+                cache.flush()
         else:
             cache_hits += 1
         for fact in facts:

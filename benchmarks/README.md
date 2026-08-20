@@ -103,7 +103,7 @@ snipara-memory longmemeval-ingest \
   --model "$LM_STUDIO_MODEL" \
   --reasoning-effort low \
   --limit 50 \
-  --max-tokens 2048 \
+  --max-tokens 4096 \
   --retries 4 \
   --cache .cache/longmemeval-lmstudio.json \
   --json
