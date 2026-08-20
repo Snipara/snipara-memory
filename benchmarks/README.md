@@ -101,6 +101,7 @@ snipara-memory longmemeval-ingest \
   /path/to/longmemeval_s_cleaned.json \
   --extractor lm-studio \
   --model "$LM_STUDIO_MODEL" \
+  --reasoning-effort low \
   --limit 50 \
   --max-tokens 2048 \
   --retries 4 \
@@ -115,7 +116,10 @@ deliberately omitted from the model input. `--prompt-version` and the model
 identifier are part of the cache key, so changing either starts a fresh
 extraction pass while preserving the previous cache for comparison.
 Transport failures and malformed structured responses are retried with a
-bounded backoff.
+bounded backoff; when the model truncates the JSON tail, complete fact objects
+before the truncation are retained and marked in metadata. For
+reasoning-capable local models such as gpt-oss, `--reasoning-effort low` keeps
+extraction latency bounded while preserving structured output.
 
 The first pass is compute-bound and can take a long time on a local model.
 Replay the same command to use the cache, and do not interpret this ingestion

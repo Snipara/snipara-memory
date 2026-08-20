@@ -120,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="lmstudio-fact-extractor-v1",
         help="Cache-busting extraction prompt version",
     )
+    longmemeval.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=os.getenv("LM_STUDIO_REASONING_EFFORT"),
+        help="Reasoning effort for reasoning-capable local models",
+    )
     longmemeval.add_argument("--temperature", type=float, default=0.0)
     longmemeval.add_argument("--max-tokens", type=int, default=2048)
     longmemeval.add_argument("--timeout", type=float, default=120.0)
@@ -278,6 +284,7 @@ def _build_longmemeval_extractor(args: argparse.Namespace):
         base_url=args.base_url,
         api_key=args.api_key,
         prompt_version=args.prompt_version,
+        reasoning_effort=args.reasoning_effort,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         timeout_seconds=args.timeout,

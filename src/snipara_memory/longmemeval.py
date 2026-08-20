@@ -12,7 +12,7 @@ import hashlib
 import inspect
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -314,6 +314,7 @@ class LmStudioFactExtractor:
     base_url: str = LM_STUDIO_DEFAULT_BASE_URL
     api_key: str = "lm-studio"
     prompt_version: str = LM_STUDIO_DEFAULT_PROMPT_VERSION
+    reasoning_effort: str | None = None
     temperature: float = 0.0
     max_tokens: int = 2048
     timeout_seconds: float = 120.0
@@ -326,6 +327,10 @@ class LmStudioFactExtractor:
             raise ValueError("LM Studio extractor requires a model identifier")
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("LM Studio base_url must start with http:// or https://")
+        if self.reasoning_effort is not None:
+            self.reasoning_effort = self.reasoning_effort.lower()
+            if self.reasoning_effort not in {"low", "medium", "high"}:
+                raise ValueError("reasoning_effort must be low, medium, high, or None")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if self.timeout_seconds <= 0:
@@ -337,13 +342,23 @@ class LmStudioFactExtractor:
     def version(self) -> str:
         """Cache identity for the model and the extraction prompt contract."""
 
-        return f"{self.model}:{self.prompt_version}"
+        reasoning_suffix = (
+            f":reasoning-{self.reasoning_effort}"
+            if self.reasoning_effort is not None
+            else ""
+        )
+        return f"{self.model}:{self.prompt_version}{reasoning_suffix}"
 
     async def extract(self, session: LongMemEvalSession) -> Sequence[ExtractedFact]:
         payload = self._build_payload(session)
         for attempt in range(self.retries + 1):
             try:
-                response = await asyncio.to_thread(self._post_json, payload)
+                request_payload = (
+                    payload
+                    if attempt == 0
+                    else self._build_payload(session, compact_retry=True)
+                )
+                response = await asyncio.to_thread(self._post_json, request_payload)
                 return _facts_from_lm_studio_response(response)
             except _LmStudioRequestError as error:
                 if attempt >= self.retries:
@@ -361,9 +376,22 @@ class LmStudioFactExtractor:
                 await asyncio.sleep(min(2**attempt, 8))
         raise AssertionError("LM Studio retry loop exited unexpectedly")
 
-    def _build_payload(self, session: LongMemEvalSession) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        session: LongMemEvalSession,
+        *,
+        compact_retry: bool = False,
+    ) -> dict[str, Any]:
+        system_prompt = LM_STUDIO_SYSTEM_PROMPT
         # Deliberately omit LongMemEval's `has_answer` labels: they are ground
         # truth for evaluation and must never leak into the extraction prompt.
+        if compact_retry:
+            system_prompt += """
+
+This is a retry after invalid JSON. Return compact JSON only, with at most 8
+high-value facts. Keep each content and title short, use at most 5 tags per
+fact, and never include commentary outside the JSON object.
+"""
         session_payload = {
             "session_id": session.session_id,
             "session_date": session.date,
@@ -371,10 +399,10 @@ class LmStudioFactExtractor:
                 {"role": turn.role, "content": turn.content} for turn in session.turns
             ],
         }
-        return {
+        payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": LM_STUDIO_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -396,6 +424,9 @@ class LmStudioFactExtractor:
                 },
             },
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        return payload
 
     def _post_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         request = Request(
@@ -444,7 +475,15 @@ def _facts_from_lm_studio_response(
         lines = lines[1:] if lines and lines[0].startswith("```") else lines
         lines = lines[:-1] if lines and lines[-1].strip() == "```" else lines
         content = "\n".join(lines).strip()
-    decoded = json.loads(content)
+    salvaged = False
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError:
+        recovered = _salvage_completed_fact_objects(content)
+        if recovered is None:
+            raise
+        decoded = {"facts": recovered}
+        salvaged = True
     if isinstance(decoded, list):
         raw_facts = decoded
     elif isinstance(decoded, Mapping):
@@ -454,9 +493,62 @@ def _facts_from_lm_studio_response(
     if not isinstance(raw_facts, list):
         raise ValueError("LM Studio response must contain a facts array")
     try:
-        return [ExtractedFact.from_mapping(fact) for fact in raw_facts]
+        facts = [ExtractedFact.from_mapping(fact) for fact in raw_facts]
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"LM Studio returned an invalid fact: {error}") from error
+    if salvaged:
+        facts = [
+            replace(
+                fact,
+                metadata={
+                    **fact.metadata,
+                    "lm_studio_parse": "salvaged_json_prefix",
+                },
+            )
+            for fact in facts
+        ]
+    return facts
+
+
+def _salvage_completed_fact_objects(
+    content: str,
+) -> list[Mapping[str, Any]] | None:
+    """Recover complete fact objects when the model truncates the JSON tail."""
+
+    facts_marker = content.find('"facts"')
+    array_start = content.find("[", facts_marker if facts_marker >= 0 else 0)
+    if array_start < 0:
+        return None
+
+    decoder = json.JSONDecoder()
+    position = array_start + 1
+    recovered: list[Mapping[str, Any]] = []
+    while position < len(content):
+        while position < len(content) and content[position].isspace():
+            position += 1
+        if position >= len(content):
+            return recovered or None
+        if content[position] == "]":
+            return recovered
+        try:
+            value, end = decoder.raw_decode(content, position)
+        except json.JSONDecodeError:
+            return recovered or None
+        if not isinstance(value, Mapping):
+            return recovered or None
+        recovered.append(value)
+        position = end
+        while position < len(content) and content[position].isspace():
+            position += 1
+        if position >= len(content):
+            return recovered
+        if content[position] == ",":
+            position += 1
+            continue
+        if content[position] == "]":
+            return recovered
+        return recovered or None
+    return recovered or None
 
 
 class HeuristicFactExtractor:

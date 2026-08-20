@@ -20,6 +20,7 @@ from snipara_memory import (
     ingest_longmemeval_dataset,
     load_longmemeval_instances,
 )
+from snipara_memory.longmemeval import _facts_from_lm_studio_response
 
 
 def _question_payload() -> dict[str, object]:
@@ -227,6 +228,7 @@ async def test_lm_studio_extractor_uses_structured_output_without_ground_truth()
         extractor = LmStudioFactExtractor(
             model="local-test-model",
             base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            reasoning_effort="low",
             retries=0,
         )
         facts = await extractor.extract(session)
@@ -238,6 +240,7 @@ async def test_lm_studio_extractor_uses_structured_output_without_ground_truth()
         payload = server.requests[0]
         assert payload["model"] == "local-test-model"
         assert payload["response_format"]["type"] == "json_schema"
+        assert payload["reasoning_effort"] == "low"
         user_prompt = payload["messages"][1]["content"]
         assert "has_answer" not in user_prompt
         assert "I prefer Zurich." in user_prompt
@@ -254,3 +257,33 @@ def test_lm_studio_version_changes_when_model_or_prompt_changes() -> None:
         ).version
         != base.version
     )
+    assert (
+        LmStudioFactExtractor(model="model-a", reasoning_effort="low").version
+        != base.version
+    )
+
+
+def test_lm_studio_salvages_complete_facts_before_truncated_json() -> None:
+    complete_fact = {
+        "content": "The user prefers Zurich.",
+        "title": "City preference",
+        "memory_type": "PREFERENCE",
+        "confidence": 0.91,
+        "fact_key": "user.city",
+        "supersedes_fact_key": None,
+        "source_turn_indices": [0],
+        "tags": ["profile"],
+    }
+    truncated_content = (
+        '{"facts":['
+        + json.dumps(complete_fact)
+        + ',{"content":"The second fact is truncated'
+    )
+
+    facts = _facts_from_lm_studio_response(
+        {"choices": [{"message": {"content": truncated_content}}]}
+    )
+
+    assert len(facts) == 1
+    assert facts[0].content == "The user prefers Zurich."
+    assert facts[0].metadata["lm_studio_parse"] == "salvaged_json_prefix"
