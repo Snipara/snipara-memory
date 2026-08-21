@@ -56,6 +56,7 @@ from .qa import (
     LmStudioLongMemEvalReader,
     official_longmemeval_judge_prompt,
     run_longmemeval_qa,
+    stratified_longmemeval_question_ids,
     write_longmemeval_hypotheses,
 )
 
@@ -119,5 +120,6 @@ __all__ = [
     "LONGMEMEVAL_READER_PROMPT_VERSION",
     "official_longmemeval_judge_prompt",
     "run_longmemeval_qa",
+    "stratified_longmemeval_question_ids",
     "write_longmemeval_hypotheses",
 ]

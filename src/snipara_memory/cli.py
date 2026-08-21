@@ -27,7 +27,12 @@ from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
 from .longmemeval import HeuristicFactExtractor, LmStudioFactExtractor
 from .mcp_server import run_stdio_server
-from .qa import LmStudioLongMemEvalJudge, LmStudioLongMemEvalReader, write_longmemeval_hypotheses
+from .qa import (
+    LmStudioLongMemEvalJudge,
+    LmStudioLongMemEvalReader,
+    stratified_longmemeval_question_ids,
+    write_longmemeval_hypotheses,
+)
 
 
 COMMANDS = {
@@ -133,6 +138,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     longmemeval.add_argument("--temperature", type=float, default=0.0)
     longmemeval.add_argument("--max-tokens", type=int, default=2048)
+    longmemeval.add_argument("--max-session-chars", type=int, default=24000)
+    longmemeval.add_argument("--extraction-concurrency", type=int, default=1)
+    longmemeval.add_argument(
+        "--retry-failed-sessions",
+        action="store_true",
+        help="Retry sessions recorded as failed in the extraction cache",
+    )
     longmemeval.add_argument("--timeout", type=float, default=120.0)
     longmemeval.add_argument("--retries", type=int, default=2)
     longmemeval.add_argument("--json", action="store_true", help="Render JSON output")
@@ -156,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     longmemeval_qa.add_argument(
         "--limit", type=int, default=50, help="Maximum number of questions to score"
+    )
+    longmemeval_qa.add_argument(
+        "--question-id",
+        action="append",
+        dest="question_ids",
+        help="Explicit question ID to score; may be repeated",
+    )
+    longmemeval_qa.add_argument(
+        "--stratified-per-category",
+        type=int,
+        help="Select this many questions from every LongMemEval category",
     )
     longmemeval_qa.add_argument(
         "--retrieval-k", type=int, default=8, help="Number of memories passed to the reader"
@@ -205,6 +228,18 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval_qa.add_argument("--reader-max-tokens", type=int, default=512)
     longmemeval_qa.add_argument("--judge-max-tokens", type=int, default=10)
     longmemeval_qa.add_argument("--extractor-max-tokens", type=int, default=4096)
+    longmemeval_qa.add_argument("--max-session-chars", type=int, default=24000)
+    longmemeval_qa.add_argument(
+        "--extraction-concurrency",
+        type=int,
+        default=1,
+        help="Maximum number of uncached extraction calls in flight",
+    )
+    longmemeval_qa.add_argument(
+        "--retry-failed-sessions",
+        action="store_true",
+        help="Retry sessions recorded as failed in the extraction cache",
+    )
     longmemeval_qa.add_argument("--timeout", type=float, default=180.0)
     longmemeval_qa.add_argument("--retries", type=int, default=1)
     longmemeval_qa.add_argument("--json", action="store_true", help="Render JSON output")
@@ -346,6 +381,8 @@ async def _run_longmemeval_ingest(args: argparse.Namespace) -> None:
         _build_longmemeval_extractor(args),
         cache_path=args.cache,
         limit=args.limit,
+        extraction_concurrency=args.extraction_concurrency,
+        retry_failed=args.retry_failed_sessions,
     )
     print(
         longmemeval_ingestion_report_as_json(report)
@@ -387,6 +424,7 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
             max_tokens=args.extractor_max_tokens,
             timeout_seconds=args.timeout,
             retries=args.retries,
+            max_session_chars=args.max_session_chars,
         )
     )
     reader = LmStudioLongMemEvalReader(
@@ -407,6 +445,23 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout,
         retries=args.retries,
     )
+    if args.stratified_per_category is not None:
+        if args.stratified_per_category <= 0:
+            raise SystemExit("--stratified-per-category must be positive.")
+        if args.question_ids:
+            raise SystemExit(
+                "Use either --question-id or --stratified-per-category, not both."
+            )
+    selected_question_ids = (
+        set(
+            stratified_longmemeval_question_ids(
+                args.dataset,
+                per_category=args.stratified_per_category,
+            )
+        )
+        if args.stratified_per_category is not None
+        else set(args.question_ids) if args.question_ids else None
+    )
     report = await run_longmemeval_qa(
         args.dataset,
         extractor,
@@ -414,8 +469,11 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
         judge,
         ingestion_cache_path=args.cache,
         qa_cache_path=args.qa_cache,
-        limit=args.limit,
+        limit=None if selected_question_ids is not None else args.limit,
         retrieval_k=args.retrieval_k,
+        question_ids=selected_question_ids,
+        extraction_concurrency=args.extraction_concurrency,
+        retry_failed=args.retry_failed_sessions,
     )
     if args.hypotheses:
         write_longmemeval_hypotheses(report, args.hypotheses)
@@ -441,4 +499,5 @@ def _build_longmemeval_extractor(args: argparse.Namespace):
         max_tokens=args.max_tokens,
         timeout_seconds=args.timeout,
         retries=args.retries,
+        max_session_chars=args.max_session_chars,
     )

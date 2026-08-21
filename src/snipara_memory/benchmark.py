@@ -141,6 +141,8 @@ async def run_longmemeval_ingestion(
     *,
     cache_path: str | Path | None = None,
     limit: int | None = 50,
+    extraction_concurrency: int = 1,
+    retry_failed: bool = False,
 ) -> LongMemEvalIngestionReport:
     """Run the fact-ingestion stage against a bounded LongMemEval subset.
 
@@ -156,6 +158,8 @@ async def run_longmemeval_ingestion(
         extractor,
         cache_path=cache_path,
         limit=limit,
+        extraction_concurrency=extraction_concurrency,
+        retry_failed=retry_failed,
     )
 
 
@@ -169,6 +173,9 @@ async def run_longmemeval_qa(
     qa_cache_path: str | Path | None = None,
     limit: int | None = 50,
     retrieval_k: int = 8,
+    question_ids: set[str] | None = None,
+    extraction_concurrency: int = 1,
+    retry_failed: bool = False,
 ) -> LongMemEvalQAReport:
     """Run retrieve -> reader -> official judge on a LongMemEval subset."""
 
@@ -181,6 +188,9 @@ async def run_longmemeval_qa(
         qa_cache_path=qa_cache_path,
         limit=limit,
         retrieval_k=retrieval_k,
+        question_ids=question_ids,
+        extraction_concurrency=extraction_concurrency,
+        retry_failed=retry_failed,
     )
 
 
@@ -247,6 +257,9 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
         "judge_cache_hits": report.judge_cache_hits,
         "judge_cache_misses": report.judge_cache_misses,
         "ingestion_failed_session_count": report.ingestion_failed_session_count,
+        "retrieval_evaluable_count": report.retrieval_evaluable_count,
+        "retrieval_hit_count": report.retrieval_hit_count,
+        "retrieval_recall_at_k": report.retrieval_recall_at_k,
         "categories": [
             {
                 "category": category.category,
@@ -255,6 +268,9 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "correct_count": category.correct_count,
                 "failed_count": category.failed_count,
                 "accuracy": category.accuracy,
+                "retrieval_evaluable_count": category.retrieval_evaluable_count,
+                "retrieval_hit_count": category.retrieval_hit_count,
+                "retrieval_recall_at_k": category.retrieval_recall_at_k,
             }
             for category in report.categories
         ],
@@ -265,6 +281,10 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "category": question.category,
                 "retrieved_count": question.retrieved_count,
                 "retrieved_titles": list(question.retrieved_titles),
+                "retrieved_answer_session_ids": list(
+                    question.retrieved_answer_session_ids
+                ),
+                "retrieval_hit_at_k": question.retrieval_hit_at_k,
                 "reader_response": question.reader_response,
                 "judge_response": question.judge_response,
                 "judge_label": question.judge_label,
@@ -296,6 +316,7 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
         f"Questions: {report.question_count}",
         f"Scored: {report.scored_count} ({report.coverage:.3f} coverage)",
         f"Accuracy: {report.accuracy:.3f}",
+        f"Answer-session recall@{report.retrieval_k}: {report.retrieval_recall_at_k:.3f}",
         f"Reader cache hits/misses: {report.reader_cache_hits}/{report.reader_cache_misses}",
         f"Judge cache hits/misses: {report.judge_cache_hits}/{report.judge_cache_misses}",
         f"Failed ingestion sessions: {report.ingestion_failed_session_count}",
@@ -304,7 +325,9 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
     ]
     lines.extend(
         f"- {category.category}: {category.correct_count}/{category.scored_count} "
-        f"({category.accuracy:.3f}; {category.question_count} questions)"
+        f"accuracy={category.accuracy:.3f}; "
+        f"retrieval@{report.retrieval_k}={category.retrieval_recall_at_k:.3f}; "
+        f"{category.question_count} questions"
         for category in report.categories
     )
     return "\n".join(lines)

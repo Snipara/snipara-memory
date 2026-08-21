@@ -87,6 +87,19 @@ def test_load_longmemeval_instances_validates_parallel_session_fields(
     )
 
 
+def test_load_longmemeval_instances_skips_blank_turn_placeholders(
+    tmp_path: Path,
+) -> None:
+    payload = _question_payload()
+    payload["haystack_sessions"][0].append({"role": "user", "content": ""})
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([payload]), encoding="utf-8")
+
+    questions = load_longmemeval_instances(dataset, limit=1)
+
+    assert len(questions[0].sessions[0].turns) == 1
+
+
 async def test_ingestion_uses_cache_and_invalidates_by_extractor_version(
     tmp_path: Path,
 ) -> None:
@@ -240,6 +253,22 @@ async def test_ingestion_flushes_extraction_cache_after_each_session(
     )
     assert replay.questions[0].failed_session_ids == ("session-2",)
 
+    class RecoveringExtractor(FailOnSecondSession):
+        async def extract(self, session) -> list[ExtractedFact]:
+            if session.session_id == "session-2":
+                return [ExtractedFact(content="The user now lives in Zurich.")]
+            return await super().extract(session)
+
+    recovered = await ingest_longmemeval_dataset(
+        MemoryService(InMemoryMemoryStore()),
+        dataset,
+        RecoveringExtractor(),
+        cache_path=cache_path,
+        retry_failed=True,
+    )
+    assert recovered.questions[0].failed_session_ids == ()
+    assert recovered.questions[0].cache_misses == 1
+
 
 def questions_hash(dataset: Path, index: int) -> str:
     question = load_longmemeval_instances(dataset)[index]
@@ -334,6 +363,55 @@ async def test_lm_studio_extractor_uses_structured_output_without_ground_truth()
         user_prompt = payload["messages"][1]["content"]
         assert "has_answer" not in user_prompt
         assert "I prefer Zurich." in user_prompt
+
+
+async def test_lm_studio_extractor_chunks_large_sessions_and_maps_turn_indices() -> (
+    None
+):
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "facts": [
+                                {
+                                    "content": "A durable fact.",
+                                    "title": "Fact",
+                                    "memory_type": "FACT",
+                                    "confidence": 0.8,
+                                    "fact_key": None,
+                                    "supersedes_fact_key": None,
+                                    "source_turn_indices": [0],
+                                    "tags": [],
+                                }
+                            ]
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    session = LongMemEvalSession(
+        session_id="large-session",
+        date="2024-06-01",
+        turns=(
+            LongMemEvalTurn(role="user", content="abcdef"),
+            LongMemEvalTurn(role="assistant", content="ghijkl"),
+        ),
+    )
+
+    with _json_server(response) as server:
+        extractor = LmStudioFactExtractor(
+            model="local-test-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            max_session_chars=8,
+            retries=0,
+        )
+        facts = await extractor.extract(session)
+
+    assert len(server.requests) == 2
+    assert [fact.source_turn_indices for fact in facts] == [(0,), (1,)]
 
 
 def test_lm_studio_version_changes_when_model_or_prompt_changes() -> None:
@@ -450,12 +528,16 @@ async def test_qa_pipeline_retrieves_reads_judges_and_replays_cache(
         qa_cache_path=qa_cache,
         limit=1,
         retrieval_k=3,
+        extraction_concurrency=2,
     )
 
     assert first.accuracy == 1.0
     assert first.coverage == 1.0
+    assert first.retrieval_recall_at_k == 1.0
     assert first.categories[0].category == "knowledge-update"
+    assert first.categories[0].retrieval_recall_at_k == 1.0
     assert first.questions[0].retrieved_count == 1
+    assert first.questions[0].retrieval_hit_at_k is True
     assert first_reader.calls == 1
     assert first_judge.calls == 1
 
@@ -470,6 +552,7 @@ async def test_qa_pipeline_retrieves_reads_judges_and_replays_cache(
         qa_cache_path=qa_cache,
         limit=1,
         retrieval_k=3,
+        extraction_concurrency=2,
     )
 
     assert replay.reader_cache_hits == 1

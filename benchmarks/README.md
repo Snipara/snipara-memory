@@ -170,10 +170,26 @@ snipara-memory longmemeval-qa \
   --json
 ```
 
+Before paying for a larger run, use a category-balanced sample. This selects
+the first N questions from each LongMemEval category and ignores `--limit`:
+
+```bash
+snipara-memory longmemeval-qa \
+  /path/to/longmemeval_s_cleaned.json \
+  --cache .cache/longmemeval-extractions.json \
+  --qa-cache .cache/longmemeval-qa-stratified.json \
+  --model qwen/qwen3-30b-a3b-2507 \
+  --stratified-per-category 10 \
+  --hypotheses .cache/longmemeval-stratified-hypotheses.jsonl \
+  --json
+```
+
 The JSON report contains overall accuracy and coverage, cache hit/miss counts,
-failed stages, reader outputs, raw judge outputs, and accuracy by question
-category. `--hypotheses` writes the upstream evaluator format with one
-`question_id`/`hypothesis` object per line.
+failed stages, reader outputs, raw judge outputs, answer-session recall@k, and
+accuracy/retrieval recall by question category. `--hypotheses` writes the
+upstream evaluator format with one `question_id`/`hypothesis` object per line.
+The answer-session recall metric uses the benchmark's `answer_session_ids` only
+for diagnosis; those labels are never sent to the reader.
 
 The judge prompt is kept in code as a versioned adapter of
 `src/evaluation/evaluate_qa.py` from the upstream LongMemEval repository. A

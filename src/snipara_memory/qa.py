@@ -524,6 +524,8 @@ class LongMemEvalQAResult:
     category: str
     retrieved_count: int
     retrieved_titles: tuple[str, ...]
+    retrieved_answer_session_ids: tuple[str, ...]
+    retrieval_hit_at_k: bool | None
     reader_response: str | None
     judge_response: str | None
     judge_label: bool | None
@@ -539,10 +541,20 @@ class LongMemEvalCategoryReport:
     scored_count: int
     correct_count: int
     failed_count: int
+    retrieval_evaluable_count: int
+    retrieval_hit_count: int
 
     @property
     def accuracy(self) -> float:
         return self.correct_count / self.scored_count if self.scored_count else 0.0
+
+    @property
+    def retrieval_recall_at_k(self) -> float:
+        return (
+            self.retrieval_hit_count / self.retrieval_evaluable_count
+            if self.retrieval_evaluable_count
+            else 0.0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +571,8 @@ class LongMemEvalQAReport:
     judge_cache_hits: int
     judge_cache_misses: int
     ingestion_failed_session_count: int
+    retrieval_evaluable_count: int
+    retrieval_hit_count: int
     categories: tuple[LongMemEvalCategoryReport, ...]
     questions: tuple[LongMemEvalQAResult, ...]
 
@@ -570,9 +584,38 @@ class LongMemEvalQAReport:
     def coverage(self) -> float:
         return self.scored_count / self.question_count if self.question_count else 0.0
 
+    @property
+    def retrieval_recall_at_k(self) -> float:
+        return (
+            self.retrieval_hit_count / self.retrieval_evaluable_count
+            if self.retrieval_evaluable_count
+            else 0.0
+        )
+
 
 def _question_category(question: LongMemEvalQuestion) -> str:
     return "abstention" if "_abs" in question.question_id else question.question_type
+
+
+def stratified_longmemeval_question_ids(
+    dataset_path: str | Path,
+    *,
+    per_category: int,
+) -> tuple[str, ...]:
+    """Select the first N questions from every LongMemEval category."""
+
+    if per_category <= 0:
+        raise ValueError("per_category must be positive")
+    questions = load_longmemeval_instances(dataset_path)
+    selected: list[str] = []
+    counts: dict[str, int] = {}
+    for question in questions:
+        category = _question_category(question)
+        if counts.get(category, 0) >= per_category:
+            continue
+        selected.append(question.question_id)
+        counts[category] = counts.get(category, 0) + 1
+    return tuple(selected)
 
 
 def _retrieval_input_hash(
@@ -612,12 +655,21 @@ async def run_longmemeval_qa(
     qa_cache_path: str | Path | None = None,
     limit: int | None = 50,
     retrieval_k: int = 8,
+    question_ids: set[str] | None = None,
+    extraction_concurrency: int = 1,
+    retry_failed: bool = False,
 ) -> LongMemEvalQAReport:
     """Run LongMemEval ingestion, retrieval, reader generation, and judging."""
 
     if retrieval_k <= 0:
         raise ValueError("retrieval_k must be positive")
-    questions = load_longmemeval_instances(dataset_path, limit=limit)
+    if extraction_concurrency <= 0:
+        raise ValueError("extraction_concurrency must be positive")
+    questions = load_longmemeval_instances(
+        dataset_path,
+        limit=limit,
+        question_ids=question_ids,
+    )
     extraction_cache = (
         ExtractionCache(Path(ingestion_cache_path))
         if ingestion_cache_path is not None
@@ -640,6 +692,8 @@ async def run_longmemeval_qa(
                 question,
                 extractor,
                 cache=extraction_cache,
+                extraction_concurrency=extraction_concurrency,
+                retry_failed=retry_failed,
             )
             ingestion_failed_session_count += len(ingestion.failed_session_ids)
             matches = await service.semantic_recall(
@@ -657,6 +711,8 @@ async def run_longmemeval_qa(
                     category=category,
                     retrieved_count=0,
                     retrieved_titles=(),
+                    retrieved_answer_session_ids=(),
+                    retrieval_hit_at_k=None,
                     reader_response=None,
                     judge_response=None,
                     judge_label=None,
@@ -667,6 +723,17 @@ async def run_longmemeval_qa(
             )
             continue
 
+        answer_session_ids = set(question.answer_session_ids)
+        retrieved_answer_session_ids = tuple(
+            dict.fromkeys(
+                str(match.memory.metadata["source_session_id"])
+                for match in matches
+                if match.memory.metadata.get("source_session_id") in answer_session_ids
+            )
+        )
+        retrieval_hit_at_k = (
+            bool(retrieved_answer_session_ids) if answer_session_ids else None
+        )
         input_hash = _retrieval_input_hash(question, matches, retrieval_k)
         reader_response: str | None = None
         if qa_cache:
@@ -691,6 +758,8 @@ async def run_longmemeval_qa(
                         retrieved_titles=tuple(
                             match.memory.title or match.memory.content for match in matches
                         ),
+                        retrieved_answer_session_ids=retrieved_answer_session_ids,
+                        retrieval_hit_at_k=retrieval_hit_at_k,
                         reader_response=None,
                         judge_response=None,
                         judge_label=None,
@@ -739,6 +808,8 @@ async def run_longmemeval_qa(
                         retrieved_titles=tuple(
                             match.memory.title or match.memory.content for match in matches
                         ),
+                        retrieved_answer_session_ids=retrieved_answer_session_ids,
+                        retrieval_hit_at_k=retrieval_hit_at_k,
                         reader_response=reader_response,
                         judge_response=None,
                         judge_label=None,
@@ -770,6 +841,8 @@ async def run_longmemeval_qa(
                 retrieved_titles=tuple(
                     match.memory.title or match.memory.content for match in matches
                 ),
+                retrieved_answer_session_ids=retrieved_answer_session_ids,
+                retrieval_hit_at_k=retrieval_hit_at_k,
                 reader_response=reader_response,
                 judge_response=judge_response,
                 judge_label=judge_label,
@@ -793,6 +866,12 @@ async def run_longmemeval_qa(
         judge_cache_hits=judge_cache_hits,
         judge_cache_misses=judge_cache_misses,
         ingestion_failed_session_count=ingestion_failed_session_count,
+        retrieval_evaluable_count=sum(
+            result.retrieval_hit_at_k is not None for result in results
+        ),
+        retrieval_hit_count=sum(
+            result.retrieval_hit_at_k is True for result in results
+        ),
         categories=tuple(categories),
         questions=tuple(results),
     )
@@ -822,6 +901,12 @@ def _build_category_reports(
             scored_count=sum(item.judge_label is not None for item in group),
             correct_count=sum(item.judge_label is True for item in group),
             failed_count=sum(item.judge_label is None for item in group),
+            retrieval_evaluable_count=sum(
+                item.retrieval_hit_at_k is not None for item in group
+            ),
+            retrieval_hit_count=sum(
+                item.retrieval_hit_at_k is True for item in group
+            ),
         )
         for category, group in sorted(grouped.items())
     ]

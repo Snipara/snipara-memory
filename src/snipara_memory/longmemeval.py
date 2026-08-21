@@ -143,10 +143,22 @@ class LongMemEvalSession:
     ) -> "LongMemEvalSession":
         if not isinstance(turns, Sequence) or isinstance(turns, (str, bytes)):
             raise ValueError("LongMemEval sessions must contain a list of turns")
+        parsed_turns = []
+        for turn in turns:
+            if (
+                isinstance(turn, Mapping)
+                and isinstance(turn.get("content"), str)
+                and not turn["content"].strip()
+            ):
+                # The cleaned upstream dataset contains occasional empty user
+                # or assistant placeholders. They carry no evidence and would
+                # otherwise abort a full-dataset selection before extraction.
+                continue
+            parsed_turns.append(LongMemEvalTurn.from_payload(turn))
         return cls(
             session_id=str(session_id),
             date=str(session_date),
-            turns=tuple(LongMemEvalTurn.from_payload(turn) for turn in turns),
+            turns=tuple(parsed_turns),
         )
 
     @property
@@ -321,6 +333,7 @@ class LmStudioFactExtractor:
     max_tokens: int = 2048
     timeout_seconds: float = 120.0
     retries: int = 2
+    max_session_chars: int = 24000
 
     def __post_init__(self) -> None:
         self.model = self.model.strip()
@@ -339,6 +352,8 @@ class LmStudioFactExtractor:
             raise ValueError("timeout_seconds must be positive")
         if self.retries < 0:
             raise ValueError("retries cannot be negative")
+        if self.max_session_chars <= 0:
+            raise ValueError("max_session_chars must be positive")
 
     @property
     def version(self) -> str:
@@ -352,6 +367,31 @@ class LmStudioFactExtractor:
         return f"{self.model}:{self.prompt_version}{reasoning_suffix}"
 
     async def extract(self, session: LongMemEvalSession) -> Sequence[ExtractedFact]:
+        """Extract one session, chunking oversized transcripts safely."""
+
+        chunks = self._session_chunks(session)
+        if len(chunks) == 1 and chunks[0][1] == tuple(range(len(session.turns))):
+            return await self._extract_chunk(session)
+
+        facts: list[ExtractedFact] = []
+        for chunk, original_turn_indices in chunks:
+            chunk_facts = await self._extract_chunk(chunk)
+            for fact in chunk_facts:
+                facts.append(
+                    replace(
+                        fact,
+                        source_turn_indices=tuple(
+                            original_turn_indices[index]
+                            for index in fact.source_turn_indices
+                            if 0 <= index < len(original_turn_indices)
+                        ),
+                    )
+                )
+        return facts
+
+    async def _extract_chunk(
+        self, session: LongMemEvalSession
+    ) -> list[ExtractedFact]:
         payload = self._build_payload(session)
         for attempt in range(self.retries + 1):
             try:
@@ -377,6 +417,64 @@ class LmStudioFactExtractor:
                     ) from error
                 await asyncio.sleep(min(2**attempt, 8))
         raise AssertionError("LM Studio retry loop exited unexpectedly")
+
+    def _session_chunks(
+        self, session: LongMemEvalSession
+    ) -> list[tuple[LongMemEvalSession, tuple[int, ...]]]:
+        """Split a session by character budget while retaining turn mapping."""
+
+        if sum(len(turn.content) for turn in session.turns) <= self.max_session_chars:
+            return [(session, tuple(range(len(session.turns))))]
+
+        chunks: list[tuple[LongMemEvalSession, tuple[int, ...]]] = []
+        current_turns: list[LongMemEvalTurn] = []
+        current_indices: list[int] = []
+        current_chars = 0
+
+        def flush() -> None:
+            nonlocal current_turns, current_indices, current_chars
+            if current_turns:
+                chunks.append(
+                    (
+                        LongMemEvalSession(
+                            session_id=session.session_id,
+                            date=session.date,
+                            turns=tuple(current_turns),
+                        ),
+                        tuple(current_indices),
+                    )
+                )
+            current_turns = []
+            current_indices = []
+            current_chars = 0
+
+        for original_index, turn in enumerate(session.turns):
+            content = turn.content
+            if len(content) > self.max_session_chars:
+                flush()
+                for start in range(0, len(content), self.max_session_chars):
+                    piece = replace(
+                        turn,
+                        content=content[start : start + self.max_session_chars],
+                    )
+                    chunks.append(
+                        (
+                            LongMemEvalSession(
+                                session_id=session.session_id,
+                                date=session.date,
+                                turns=(piece,),
+                            ),
+                            (original_index,),
+                        )
+                    )
+                continue
+            if current_turns and current_chars + len(content) > self.max_session_chars:
+                flush()
+            current_turns.append(turn)
+            current_indices.append(original_index)
+            current_chars += len(content)
+        flush()
+        return chunks
 
     def _build_payload(
         self,
@@ -735,9 +833,13 @@ async def ingest_longmemeval_question(
     *,
     cache: ExtractionCache | None = None,
     namespace_id: str | None = None,
+    extraction_concurrency: int = 1,
+    retry_failed: bool = False,
 ) -> LongMemEvalIngestionResult:
     """Extract and store one question's sessions as structured memories."""
 
+    if extraction_concurrency <= 0:
+        raise ValueError("extraction_concurrency must be positive")
     target_namespace = namespace_id or f"longmemeval:{question.question_id}"
     extractor_version = str(getattr(extractor, "version", extractor.__class__.__name__))
     requests: list[StoreMemoryRequest] = []
@@ -746,7 +848,13 @@ async def ingest_longmemeval_question(
     failed_session_ids: list[str] = []
     failure_messages: list[str] = []
 
-    for session in question.sessions:
+    extraction_lock = asyncio.Semaphore(extraction_concurrency)
+    cache_write_lock = asyncio.Lock()
+
+    async def extract_session(
+        index: int,
+        session: LongMemEvalSession,
+    ) -> tuple[int, str, list[ExtractedFact], str | None]:
         cache_key = f"{question.question_id}:{session.session_id}"
         cached_failure = (
             cache.get_failure(
@@ -757,23 +865,23 @@ async def ingest_longmemeval_question(
             if cache
             else None
         )
-        if cached_failure is not None:
-            failed_session_ids.append(session.session_id)
-            failure_messages.append(
-                f"{session.session_id}: cached extraction failure: {cached_failure}"
+        if cached_failure is not None and not retry_failed:
+            return (
+                index,
+                "cached-failure",
+                [],
+                f"{session.session_id}: cached extraction failure: {cached_failure}",
             )
-            continue
-        facts = (
-            cache.get(
+        facts = None
+        if cache and cached_failure is None:
+            facts = cache.get(
                 cache_key,
                 session_hash=session.content_hash,
                 extractor_version=extractor_version,
             )
-            if cache
-            else None
-        )
-        if facts is None:
-            cache_misses += 1
+        if facts is not None:
+            return index, "hit", facts, None
+        async with extraction_lock:
             try:
                 raw_facts = extractor.extract(session)
                 if inspect.isawaitable(raw_facts):
@@ -785,21 +893,21 @@ async def ingest_longmemeval_question(
                     for fact in raw_facts
                 ]
             except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
-                failed_session_ids.append(session.session_id)
                 message = (
                     f"{session.session_id}: {type(error).__name__}: {str(error)[:500]}"
                 )
-                failure_messages.append(message)
                 if cache:
-                    cache.put_failure(
-                        cache_key,
-                        session_hash=session.content_hash,
-                        extractor_version=extractor_version,
-                        error=message,
-                    )
-                    cache.flush()
-                continue
-            if cache:
+                    async with cache_write_lock:
+                        cache.put_failure(
+                            cache_key,
+                            session_hash=session.content_hash,
+                            extractor_version=extractor_version,
+                            error=message,
+                        )
+                        cache.flush()
+                return index, "failed", [], message
+        if cache:
+            async with cache_write_lock:
                 cache.put(
                     cache_key,
                     session_hash=session.content_hash,
@@ -807,8 +915,25 @@ async def ingest_longmemeval_question(
                     facts=facts,
                 )
                 cache.flush()
-        else:
+        return index, "miss", facts, None
+
+    extracted_sessions = await asyncio.gather(
+        *(extract_session(index, session) for index, session in enumerate(question.sessions))
+    )
+
+    for index, status, facts, failure_message in sorted(
+        extracted_sessions, key=lambda result: result[0]
+    ):
+        session = question.sessions[index]
+        if status == "hit":
             cache_hits += 1
+        elif status == "miss":
+            cache_misses += 1
+        elif status in {"failed", "cached-failure"}:
+            failed_session_ids.append(session.session_id)
+            if failure_message:
+                failure_messages.append(failure_message)
+            continue
         for fact in facts:
             metadata = dict(fact.metadata)
             metadata.update(
@@ -910,6 +1035,8 @@ async def ingest_longmemeval_dataset(
     cache_path: str | Path | None = None,
     limit: int | None = None,
     question_ids: set[str] | None = None,
+    extraction_concurrency: int = 1,
+    retry_failed: bool = False,
 ) -> LongMemEvalIngestionReport:
     """Ingest a bounded LongMemEval subset without bundling the dataset."""
 
@@ -919,7 +1046,14 @@ async def ingest_longmemeval_dataset(
     cache = ExtractionCache(Path(cache_path)) if cache_path is not None else None
     results = tuple(
         [
-            await ingest_longmemeval_question(service, question, extractor, cache=cache)
+            await ingest_longmemeval_question(
+                service,
+                question,
+                extractor,
+                cache=cache,
+                extraction_concurrency=extraction_concurrency,
+                retry_failed=retry_failed,
+            )
             for question in questions
         ]
     )
