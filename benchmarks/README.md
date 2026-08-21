@@ -123,13 +123,13 @@ extraction latency bounded while preserving structured output.
 
 An individual session that still returns invalid output after all retries is
 recorded in the report as a failed session and skipped so the bounded run can
-continue. Its cache entry is left absent, which makes the next replay retry
-that session instead of silently treating it as successfully extracted.
+continue. Its failure is cached for the same extractor version, so a replay
+does not repeatedly spend tokens on the same known failure.
 
 The first pass is compute-bound and can take a long time on a local model.
 Replay the same command to use the cache, and do not interpret this ingestion
-step as the final LongMemEval score: retrieval, reader generation, and the
-official LLM judge remain a separate QA layer.
+step as the final LongMemEval score. The separate QA layer below performs
+retrieval, reader generation, and official LLM judging.
 
 Run a 30–50 question ingestion dry-run after downloading the dataset locally:
 
@@ -150,6 +150,33 @@ redistributing data:
 - [upstream repository license](https://github.com/xiaowu0162/LongMemEval/blob/main/LICENSE)
 - [cleaned dataset card](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)
 
-The official QA judge prompts remain upstream-owned plumbing for the next
-benchmark phase. This adapter alone measures ingestion mechanics and should not
-be presented as a LongMemEval answer-accuracy score.
+### LongMemEval QA: retrieve, reader, judge
+
+The QA command reuses the extraction cache, creates a fresh in-memory namespace
+for each question, retrieves active extracted facts, asks a reader to answer
+from those facts, and sends the answer to the official upstream yes/no judge
+prompt. Reader and judge outputs are cached independently so an interrupted
+run can resume without repeating completed calls.
+
+```bash
+snipara-memory longmemeval-qa \
+  /path/to/longmemeval_s_cleaned.json \
+  --cache .cache/longmemeval-extractions.json \
+  --qa-cache .cache/longmemeval-qa.json \
+  --model qwen/qwen3-30b-a3b-2507 \
+  --limit 50 \
+  --retrieval-k 8 \
+  --hypotheses .cache/longmemeval-hypotheses.jsonl \
+  --json
+```
+
+The JSON report contains overall accuracy and coverage, cache hit/miss counts,
+failed stages, reader outputs, raw judge outputs, and accuracy by question
+category. `--hypotheses` writes the upstream evaluator format with one
+`question_id`/`hypothesis` object per line.
+
+The judge prompt is kept in code as a versioned adapter of
+`src/evaluation/evaluate_qa.py` from the upstream LongMemEval repository. A
+LongMemEval score still measures conversational memory, not project-memory
+continuity for coding agents; publish it beside the proprietary continuity
+suite rather than as a replacement for it.

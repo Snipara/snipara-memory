@@ -15,15 +15,19 @@ from .adapters import InMemoryMemoryStore, JsonFileMemoryStore, get_default_stor
 from .benchmark import (
     benchmark_report_as_json,
     longmemeval_ingestion_report_as_json,
+    longmemeval_qa_report_as_json,
     render_benchmark_report,
     render_longmemeval_ingestion_report,
+    render_longmemeval_qa_report,
     run_benchmark,
     run_longmemeval_ingestion,
+    run_longmemeval_qa,
 )
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
 from .longmemeval import HeuristicFactExtractor, LmStudioFactExtractor
 from .mcp_server import run_stdio_server
+from .qa import LmStudioLongMemEvalJudge, LmStudioLongMemEvalReader, write_longmemeval_hypotheses
 
 
 COMMANDS = {
@@ -32,6 +36,7 @@ COMMANDS = {
     "import-project",
     "benchmark",
     "longmemeval-ingest",
+    "longmemeval-qa",
     "mcp",
     "version",
 }
@@ -132,6 +137,78 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval.add_argument("--retries", type=int, default=2)
     longmemeval.add_argument("--json", action="store_true", help="Render JSON output")
 
+    longmemeval_qa = subparsers.add_parser(
+        "longmemeval-qa",
+        help="Run LongMemEval retrieval, reader generation, and LLM judge",
+    )
+    longmemeval_qa.add_argument("dataset", help="Path to LongMemEval JSON/JSONL dataset")
+    longmemeval_qa.add_argument(
+        "--cache",
+        help="Extraction cache path (reuse the completed ingestion pass)",
+    )
+    longmemeval_qa.add_argument(
+        "--qa-cache",
+        help="Reader/judge output cache path",
+    )
+    longmemeval_qa.add_argument(
+        "--hypotheses",
+        help="Optional JSONL path compatible with the upstream evaluator",
+    )
+    longmemeval_qa.add_argument(
+        "--limit", type=int, default=50, help="Maximum number of questions to score"
+    )
+    longmemeval_qa.add_argument(
+        "--retrieval-k", type=int, default=8, help="Number of memories passed to the reader"
+    )
+    longmemeval_qa.add_argument(
+        "--extractor",
+        choices=("heuristic", "lm-studio"),
+        default="lm-studio",
+        help="Extractor used only for sessions missing from the extraction cache",
+    )
+    longmemeval_qa.add_argument(
+        "--model",
+        default=os.getenv("LM_STUDIO_MODEL"),
+        help="Common LM Studio model fallback",
+    )
+    longmemeval_qa.add_argument(
+        "--extractor-model",
+        default=os.getenv("LM_STUDIO_EXTRACTOR_MODEL"),
+        help="Extraction model (or LM_STUDIO_EXTRACTOR_MODEL)",
+    )
+    longmemeval_qa.add_argument(
+        "--reader-model",
+        default=os.getenv("LM_STUDIO_READER_MODEL"),
+        help="Reader model (or LM_STUDIO_READER_MODEL)",
+    )
+    longmemeval_qa.add_argument(
+        "--judge-model",
+        default=os.getenv("LM_STUDIO_JUDGE_MODEL"),
+        help="Judge model (or LM_STUDIO_JUDGE_MODEL)",
+    )
+    longmemeval_qa.add_argument(
+        "--base-url",
+        default=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
+        help="LM Studio OpenAI-compatible base URL",
+    )
+    longmemeval_qa.add_argument(
+        "--api-key",
+        default=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
+        help="Local API key value, if configured",
+    )
+    longmemeval_qa.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=os.getenv("LM_STUDIO_REASONING_EFFORT"),
+        help="Reasoning effort for reader/judge and cache-miss extraction",
+    )
+    longmemeval_qa.add_argument("--reader-max-tokens", type=int, default=512)
+    longmemeval_qa.add_argument("--judge-max-tokens", type=int, default=10)
+    longmemeval_qa.add_argument("--extractor-max-tokens", type=int, default=4096)
+    longmemeval_qa.add_argument("--timeout", type=float, default=180.0)
+    longmemeval_qa.add_argument("--retries", type=int, default=1)
+    longmemeval_qa.add_argument("--json", action="store_true", help="Render JSON output")
+
     mcp = subparsers.add_parser("mcp", help="Run the MCP stdio server")
     _add_store_options(mcp)
     subparsers.add_parser("version", help="Show package version")
@@ -160,6 +237,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "longmemeval-ingest":
         asyncio.run(_run_longmemeval_ingest(args))
+        return
+    if args.command == "longmemeval-qa":
+        asyncio.run(_run_longmemeval_qa(args))
         return
     if args.command == "mcp":
         asyncio.run(
@@ -271,6 +351,78 @@ async def _run_longmemeval_ingest(args: argparse.Namespace) -> None:
         longmemeval_ingestion_report_as_json(report)
         if args.json
         else render_longmemeval_ingestion_report(report)
+    )
+
+
+async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
+    common_model = args.model
+    extractor_model = args.extractor_model or common_model
+    reader_model = args.reader_model or common_model
+    judge_model = args.judge_model or common_model
+    if args.extractor == "lm-studio" and not extractor_model:
+        raise SystemExit(
+            "LongMemEval QA extraction requires --extractor-model, --model, "
+            "or LM_STUDIO_MODEL."
+        )
+    if not reader_model:
+        raise SystemExit(
+            "LongMemEval QA reader requires --reader-model, --model, "
+            "or LM_STUDIO_READER_MODEL."
+        )
+    if not judge_model:
+        raise SystemExit(
+            "LongMemEval QA judge requires --judge-model, --model, "
+            "or LM_STUDIO_JUDGE_MODEL."
+        )
+
+    extractor = (
+        HeuristicFactExtractor()
+        if args.extractor == "heuristic"
+        else LmStudioFactExtractor(
+            model=extractor_model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            prompt_version="lmstudio-fact-extractor-v1",
+            reasoning_effort=args.reasoning_effort,
+            max_tokens=args.extractor_max_tokens,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+        )
+    )
+    reader = LmStudioLongMemEvalReader(
+        model=reader_model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=args.reader_max_tokens,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+    )
+    judge = LmStudioLongMemEvalJudge(
+        model=judge_model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        reasoning_effort=None,
+        max_tokens=args.judge_max_tokens,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+    )
+    report = await run_longmemeval_qa(
+        args.dataset,
+        extractor,
+        reader,
+        judge,
+        ingestion_cache_path=args.cache,
+        qa_cache_path=args.qa_cache,
+        limit=args.limit,
+        retrieval_k=args.retrieval_k,
+    )
+    if args.hypotheses:
+        write_longmemeval_hypotheses(report, args.hypotheses)
+    print(
+        longmemeval_qa_report_as_json(report)
+        if args.json
+        else render_longmemeval_qa_report(report)
     )
 
 

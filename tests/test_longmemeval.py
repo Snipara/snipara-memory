@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from snipara_memory import (
@@ -12,6 +13,10 @@ from snipara_memory import (
     ExtractionCache,
     InMemoryMemoryStore,
     LmStudioFactExtractor,
+    LmStudioLongMemEvalJudge,
+    LmStudioLongMemEvalReader,
+    LongMemEvalQACache,
+    LongMemEvalQuestion,
     MemoryService,
     MemoryStatus,
     MemoryType,
@@ -19,6 +24,8 @@ from snipara_memory import (
     LongMemEvalTurn,
     ingest_longmemeval_dataset,
     load_longmemeval_instances,
+    official_longmemeval_judge_prompt,
+    run_longmemeval_qa,
 )
 from snipara_memory.longmemeval import _facts_from_lm_studio_response
 
@@ -370,3 +377,144 @@ def test_lm_studio_salvages_complete_facts_before_truncated_json() -> None:
     assert len(facts) == 1
     assert facts[0].content == "The user prefers Zurich."
     assert facts[0].metadata["lm_studio_parse"] == "salvaged_json_prefix"
+
+
+def test_official_judge_prompt_uses_task_specific_rules() -> None:
+    update_prompt = official_longmemeval_judge_prompt(
+        "knowledge-update",
+        "Where do I live now?",
+        "Zurich",
+        "You now live in Zurich.",
+    )
+    temporal_prompt = official_longmemeval_judge_prompt(
+        "temporal-reasoning",
+        "How many days?",
+        "18",
+        "19 days.",
+    )
+    abstention_prompt = official_longmemeval_judge_prompt(
+        "unknown",
+        "What is my passport number?",
+        "The information is unavailable.",
+        "I cannot determine that.",
+        abstention=True,
+    )
+
+    assert "updated answer" in update_prompt
+    assert "off-by-one" in temporal_prompt
+    assert "unanswerable" in abstention_prompt
+
+
+class FakeReader:
+    version = "fake-reader-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def answer(self, question: str, memories) -> str:
+        self.calls += 1
+        assert question
+        assert memories
+        return "The user now lives in Zurich."
+
+
+class FakeJudge:
+    version = "fake-judge-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def judge(self, question, response: str) -> tuple[bool, str]:
+        self.calls += 1
+        assert question.question_type == "knowledge-update"
+        assert response
+        return True, "yes"
+
+
+async def test_qa_pipeline_retrieves_reads_judges_and_replays_cache(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([_question_payload()]), encoding="utf-8")
+    extraction_cache = tmp_path / "extractions.json"
+    qa_cache = tmp_path / "qa.json"
+
+    first_reader = FakeReader()
+    first_judge = FakeJudge()
+    first = await run_longmemeval_qa(
+        dataset,
+        CountingExtractor(),
+        first_reader,
+        first_judge,
+        ingestion_cache_path=extraction_cache,
+        qa_cache_path=qa_cache,
+        limit=1,
+        retrieval_k=3,
+    )
+
+    assert first.accuracy == 1.0
+    assert first.coverage == 1.0
+    assert first.categories[0].category == "knowledge-update"
+    assert first.questions[0].retrieved_count == 1
+    assert first_reader.calls == 1
+    assert first_judge.calls == 1
+
+    replay_reader = FakeReader()
+    replay_judge = FakeJudge()
+    replay = await run_longmemeval_qa(
+        dataset,
+        CountingExtractor(),
+        replay_reader,
+        replay_judge,
+        ingestion_cache_path=extraction_cache,
+        qa_cache_path=qa_cache,
+        limit=1,
+        retrieval_k=3,
+    )
+
+    assert replay.reader_cache_hits == 1
+    assert replay.judge_cache_hits == 1
+    assert replay_reader.calls == 0
+    assert replay_judge.calls == 0
+    assert LongMemEvalQACache(qa_cache).get_reader(
+        "q-1",
+        input_hash="wrong",
+        reader_version="fake-reader-v1",
+    ) is None
+
+
+async def test_lm_studio_reader_and_judge_use_separate_qa_contracts() -> None:
+    memory = SimpleNamespace(
+        title="Current city",
+        content="The user now lives in Zurich.",
+        type=MemoryType.FACT,
+        metadata={"source_session_date": "2024-05-01"},
+    )
+    match = SimpleNamespace(memory=memory, score=1.0)
+    question = LongMemEvalQuestion.from_payload(_question_payload())
+
+    with _json_server(
+        {"choices": [{"message": {"content": "The user lives in Zurich."}}]}
+    ) as server:
+        reader = LmStudioLongMemEvalReader(
+            model="reader-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            retries=0,
+        )
+        response = await reader.answer(question.question, [match])
+        assert response == "The user lives in Zurich."
+        reader_prompt = server.requests[0]["messages"][1]["content"]
+        assert "Where do I live now?" in reader_prompt
+        assert "The user now lives in Zurich." in reader_prompt
+        assert '"answer"' not in reader_prompt
+
+    with _json_server({"choices": [{"message": {"content": "yes"}}]}) as server:
+        judge = LmStudioLongMemEvalJudge(
+            model="judge-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            retries=0,
+        )
+        label, raw = await judge.judge(question, response)
+        assert label is True
+        assert raw == "yes"
+        assert "updated answer" in server.requests[0]["messages"][0]["content"]

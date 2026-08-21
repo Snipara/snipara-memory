@@ -43,6 +43,21 @@ from .longmemeval import (
     ingest_longmemeval_question,
     load_longmemeval_instances,
 )
+from .qa import (
+    LONGMEMEVAL_JUDGE_PROMPT_VERSION,
+    LONGMEMEVAL_READER_PROMPT_VERSION,
+    LongMemEvalCategoryReport,
+    LongMemEvalJudge,
+    LongMemEvalQACache,
+    LongMemEvalQAReport,
+    LongMemEvalQAResult,
+    LongMemEvalReader,
+    LmStudioLongMemEvalJudge,
+    LmStudioLongMemEvalReader,
+    official_longmemeval_judge_prompt,
+    run_longmemeval_qa,
+    write_longmemeval_hypotheses,
+)
 
 try:
     __version__ = version("snipara-memory")
@@ -72,6 +87,12 @@ __all__ = [
     "MemoryStore",
     "MemoryTier",
     "MemoryType",
+    "LongMemEvalCategoryReport",
+    "LongMemEvalJudge",
+    "LongMemEvalQACache",
+    "LongMemEvalQAReport",
+    "LongMemEvalQAResult",
+    "LongMemEvalReader",
     "LongMemEvalIngestionReport",
     "LongMemEvalIngestionResult",
     "LongMemEvalQuestion",
@@ -92,4 +113,11 @@ __all__ = [
     "ingest_longmemeval_dataset",
     "ingest_longmemeval_question",
     "load_longmemeval_instances",
+    "LmStudioLongMemEvalJudge",
+    "LmStudioLongMemEvalReader",
+    "LONGMEMEVAL_JUDGE_PROMPT_VERSION",
+    "LONGMEMEVAL_READER_PROMPT_VERSION",
+    "official_longmemeval_judge_prompt",
+    "run_longmemeval_qa",
+    "write_longmemeval_hypotheses",
 ]

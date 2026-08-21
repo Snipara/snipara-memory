@@ -20,6 +20,12 @@ from .longmemeval import (
     LongMemEvalIngestionReport,
     ingest_longmemeval_dataset,
 )
+from .qa import (
+    LongMemEvalJudge,
+    LongMemEvalQAReport,
+    LongMemEvalReader,
+    run_longmemeval_qa as _run_longmemeval_qa,
+)
 
 
 @dataclass(slots=True)
@@ -153,6 +159,31 @@ async def run_longmemeval_ingestion(
     )
 
 
+async def run_longmemeval_qa(
+    dataset_path: str | Path,
+    extractor: FactExtractor,
+    reader: LongMemEvalReader,
+    judge: LongMemEvalJudge,
+    *,
+    ingestion_cache_path: str | Path | None = None,
+    qa_cache_path: str | Path | None = None,
+    limit: int | None = 50,
+    retrieval_k: int = 8,
+) -> LongMemEvalQAReport:
+    """Run retrieve -> reader -> official judge on a LongMemEval subset."""
+
+    return await _run_longmemeval_qa(
+        dataset_path,
+        extractor,
+        reader,
+        judge,
+        ingestion_cache_path=ingestion_cache_path,
+        qa_cache_path=qa_cache_path,
+        limit=limit,
+        retrieval_k=retrieval_k,
+    )
+
+
 def render_benchmark_report(report: BenchmarkReport) -> str:
     lines = [
         f"Dataset: {report.dataset}",
@@ -200,6 +231,53 @@ def longmemeval_ingestion_report_as_json(report: LongMemEvalIngestionReport) -> 
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
+    payload = {
+        "dataset": report.dataset,
+        "question_count": report.question_count,
+        "scored_count": report.scored_count,
+        "correct_count": report.correct_count,
+        "accuracy": report.accuracy,
+        "coverage": report.coverage,
+        "retrieval_k": report.retrieval_k,
+        "reader_model": report.reader_model,
+        "judge_model": report.judge_model,
+        "reader_cache_hits": report.reader_cache_hits,
+        "reader_cache_misses": report.reader_cache_misses,
+        "judge_cache_hits": report.judge_cache_hits,
+        "judge_cache_misses": report.judge_cache_misses,
+        "ingestion_failed_session_count": report.ingestion_failed_session_count,
+        "categories": [
+            {
+                "category": category.category,
+                "question_count": category.question_count,
+                "scored_count": category.scored_count,
+                "correct_count": category.correct_count,
+                "failed_count": category.failed_count,
+                "accuracy": category.accuracy,
+            }
+            for category in report.categories
+        ],
+        "questions": [
+            {
+                "question_id": question.question_id,
+                "question_type": question.question_type,
+                "category": question.category,
+                "retrieved_count": question.retrieved_count,
+                "retrieved_titles": list(question.retrieved_titles),
+                "reader_response": question.reader_response,
+                "judge_response": question.judge_response,
+                "judge_label": question.judge_label,
+                "status": question.status,
+                "failed_stage": question.failed_stage,
+                "failure_message": question.failure_message,
+            }
+            for question in report.questions
+        ],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def render_longmemeval_ingestion_report(report: LongMemEvalIngestionReport) -> str:
     return (
         f"Dataset: {report.dataset}\n"
@@ -210,6 +288,26 @@ def render_longmemeval_ingestion_report(report: LongMemEvalIngestionReport) -> s
         f"Cache misses: {report.cache_misses}\n"
         f"Failed sessions: {report.failed_session_count}"
     )
+
+
+def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
+    lines = [
+        f"Dataset: {report.dataset}",
+        f"Questions: {report.question_count}",
+        f"Scored: {report.scored_count} ({report.coverage:.3f} coverage)",
+        f"Accuracy: {report.accuracy:.3f}",
+        f"Reader cache hits/misses: {report.reader_cache_hits}/{report.reader_cache_misses}",
+        f"Judge cache hits/misses: {report.judge_cache_hits}/{report.judge_cache_misses}",
+        f"Failed ingestion sessions: {report.ingestion_failed_session_count}",
+        "",
+        "By category:",
+    ]
+    lines.extend(
+        f"- {category.category}: {category.correct_count}/{category.scored_count} "
+        f"({category.accuracy:.3f}; {category.question_count} questions)"
+        for category in report.categories
+    )
+    return "\n".join(lines)
 
 
 def load_benchmark_cases(dataset_path: str | Path) -> list[BenchmarkCase]:
