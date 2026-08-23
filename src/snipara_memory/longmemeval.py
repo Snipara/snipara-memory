@@ -850,6 +850,7 @@ async def ingest_longmemeval_question(
 
     extraction_lock = asyncio.Semaphore(extraction_concurrency)
     cache_write_lock = asyncio.Lock()
+    cache_write_counter = [0]
 
     async def extract_session(
         index: int,
@@ -904,7 +905,9 @@ async def ingest_longmemeval_question(
                             extractor_version=extractor_version,
                             error=message,
                         )
-                        cache.flush()
+                        cache_write_counter[0] += 1
+                        if cache_write_counter[0] % 16 == 0:
+                            cache.flush()
                 return index, "failed", [], message
         if cache:
             async with cache_write_lock:
@@ -914,7 +917,9 @@ async def ingest_longmemeval_question(
                     extractor_version=extractor_version,
                     facts=facts,
                 )
-                cache.flush()
+                cache_write_counter[0] += 1
+                if cache_write_counter[0] % 16 == 0:
+                    cache.flush()
         return index, "miss", facts, None
 
     extracted_sessions = await asyncio.gather(
