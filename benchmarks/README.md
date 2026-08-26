@@ -115,6 +115,10 @@ and supersession keys. The dataset's `has_answer` evaluation labels are
 deliberately omitted from the model input. `--prompt-version` and the model
 identifier are part of the cache key, so changing either starts a fresh
 extraction pass while preserving the previous cache for comparison.
+The v3 prompt scans explicit user statements before assistant advice, limits
+each response to eight high-value facts, and records evidence kind and temporal
+anchors. The cache is flushed after every session, so an interrupted run can
+resume without losing the completed tail.
 Transport failures and malformed structured responses are retried with a
 bounded backoff; when the model truncates the JSON tail, complete fact objects
 before the truncation are retained and marked in metadata. For
@@ -155,7 +159,9 @@ redistributing data:
 The QA command reuses the extraction cache, creates a fresh in-memory namespace
 for each question, retrieves active extracted facts, asks a reader to answer
 from those facts, and sends the answer to the official upstream yes/no judge
-prompt. Reader and judge outputs are cached independently so an interrupted
+prompt. Retrieval reranks title/content/fact-key signals and preserves
+evidence from distinct sessions for multi-session, temporal, and update
+questions. Reader and judge outputs are cached independently so an interrupted
 run can resume without repeating completed calls.
 
 ```bash

@@ -63,6 +63,10 @@ def create_server(service: MemoryService) -> Server:
                         "category": {"type": "string"},
                         "source": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
+                        "memory_key": {"type": "string"},
+                        "supersedes_memory_key": {"type": "string"},
+                        "provenance_key": {"type": "string"},
+                        "observed_at": {"type": "string", "format": "date-time"},
                         "confidence": {"type": "number"},
                     },
                     "required": ["namespace_id", "content"],
@@ -82,6 +86,13 @@ def create_server(service: MemoryService) -> Server:
                         "types": {"type": "array", "items": {"type": "string"}},
                         "tiers": {"type": "array", "items": {"type": "string"}},
                         "tags": {"type": "array", "items": {"type": "string"}},
+                        "candidate_limit": {"type": "integer", "default": 10},
+                        "diversify_by_provenance": {"type": "boolean", "default": False},
+                        "max_per_provenance": {"type": "integer"},
+                        "deduplicate_evidence": {"type": "boolean", "default": False},
+                        "include_provenance_context": {"type": "boolean", "default": False},
+                        "provenance_context_limit": {"type": "integer"},
+                        "provenance_context_group_limit": {"type": "integer"},
                     },
                     "required": ["namespace_id", "query"],
                 },
@@ -188,6 +199,14 @@ def create_server(service: MemoryService) -> Server:
                     category=arguments.get("category"),
                     source=arguments.get("source"),
                     tags=list(arguments.get("tags", [])),
+                    memory_key=arguments.get("memory_key"),
+                    supersedes_memory_key=arguments.get("supersedes_memory_key"),
+                    provenance_key=arguments.get("provenance_key"),
+                    observed_at=(
+                        datetime.fromisoformat(arguments["observed_at"])
+                        if arguments.get("observed_at")
+                        else None
+                    ),
                     confidence=float(arguments.get("confidence", 0.7)),
                 )
             )
@@ -204,6 +223,35 @@ def create_server(service: MemoryService) -> Server:
                     types=[MemoryType(value) for value in arguments.get("types", [])],
                     tiers=[MemoryTier(value) for value in arguments.get("tiers", [])],
                     tags=list(arguments.get("tags", [])),
+                    candidate_limit=(
+                        int(arguments["candidate_limit"])
+                        if arguments.get("candidate_limit") is not None
+                        else None
+                    ),
+                    diversify_by_provenance=bool(
+                        arguments.get("diversify_by_provenance", False)
+                    ),
+                    max_per_provenance=(
+                        int(arguments["max_per_provenance"])
+                        if arguments.get("max_per_provenance") is not None
+                        else None
+                    ),
+                    deduplicate_evidence=bool(
+                        arguments.get("deduplicate_evidence", False)
+                    ),
+                    include_provenance_context=bool(
+                        arguments.get("include_provenance_context", False)
+                    ),
+                    provenance_context_limit=(
+                        int(arguments["provenance_context_limit"])
+                        if arguments.get("provenance_context_limit") is not None
+                        else None
+                    ),
+                    provenance_context_group_limit=(
+                        int(arguments["provenance_context_group_limit"])
+                        if arguments.get("provenance_context_group_limit") is not None
+                        else None
+                    ),
                 )
             )
             return [_json_result([asdict(match) for match in matches])]

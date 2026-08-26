@@ -90,6 +90,13 @@ class Memory:
     source: str | None = None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Stable semantic identity for an evolving memory.  This is deliberately
+    # separate from the storage id: a new observation can replace an older
+    # memory while keeping the identity of the thing being remembered.
+    memory_key: str | None = None
+    supersedes_memory_key: str | None = None
+    provenance_key: str | None = None
+    observed_at: datetime | None = None
     confidence: float = 1.0
     relevance_boost: float = 1.0
     access_count: int = 0
@@ -134,6 +141,10 @@ class GraveyardEntry:
     source: str | None = None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    memory_key: str | None = None
+    supersedes_memory_key: str | None = None
+    provenance_key: str | None = None
+    observed_at: datetime | None = None
     confidence: float = 1.0
     previous_tier: MemoryTier | None = None
     previous_status: MemoryStatus | None = None
@@ -177,6 +188,10 @@ class StoreMemoryRequest:
     source: str | None = None
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    memory_key: str | None = None
+    supersedes_memory_key: str | None = None
+    provenance_key: str | None = None
+    observed_at: datetime | None = None
     confidence: float = 0.7
     relevance_boost: float = 1.0
     tier: MemoryTier | None = None
@@ -200,6 +215,20 @@ class RecallQuery:
     types: list[MemoryType] = field(default_factory=list)
     tiers: list[MemoryTier] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    # Ask the store for more candidates than the final answer budget when a
+    # caller wants provenance diversity or duplicate-evidence filtering.
+    candidate_limit: int | None = None
+    diversify_by_provenance: bool = False
+    max_per_provenance: int | None = None
+    deduplicate_evidence: bool = False
+    # When enabled, include nearby evidence from a provenance group that
+    # already produced a query match. This resolves cross-turn references
+    # without forcing callers to store raw transcripts.
+    include_provenance_context: bool = False
+    provenance_context_limit: int | None = None
+    # Bound how many provenance groups can contribute sibling context. This
+    # prevents a broad candidate search from being flooded by weak groups.
+    provenance_context_group_limit: int | None = None
 
 
 @dataclass(slots=True)
@@ -237,4 +266,3 @@ class CompactionResult:
     final_count: int
     duplicates_removed: int = 0
     archived_count: int = 0
-

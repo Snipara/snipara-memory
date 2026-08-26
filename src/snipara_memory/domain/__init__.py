@@ -20,7 +20,13 @@ from .models import (
     SessionMemoryBundle,
     StoreMemoryRequest,
 )
-from .service import MemoryService, calculate_confidence_decay, classify_memory_tier
+from .service import (
+    MemoryService,
+    calculate_confidence_decay,
+    classify_memory_tier,
+    provenance_key_for_memory,
+    select_diverse_matches,
+)
 
 __all__ = [
     "CompactionResult",
@@ -44,4 +50,6 @@ __all__ = [
     "StoreMemoryRequest",
     "calculate_confidence_decay",
     "classify_memory_tier",
+    "provenance_key_for_memory",
+    "select_diverse_matches",
 ]

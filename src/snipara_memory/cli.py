@@ -25,7 +25,12 @@ from .benchmark import (
 )
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
-from .longmemeval import HeuristicFactExtractor, LmStudioFactExtractor
+from .longmemeval import (
+    HeuristicFactExtractor,
+    LM_STUDIO_DEFAULT_PROMPT_VERSION,
+    LmStudioBatchFactExtractor,
+    LmStudioFactExtractor,
+)
 from .mcp_server import run_stdio_server
 from .qa import (
     LmStudioLongMemEvalJudge,
@@ -127,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     longmemeval.add_argument(
         "--prompt-version",
-        default="lmstudio-fact-extractor-v1",
+        default=LM_STUDIO_DEFAULT_PROMPT_VERSION,
         help="Cache-busting extraction prompt version",
     )
     longmemeval.add_argument(
@@ -140,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval.add_argument("--max-tokens", type=int, default=2048)
     longmemeval.add_argument("--max-session-chars", type=int, default=24000)
     longmemeval.add_argument("--extraction-concurrency", type=int, default=1)
+    longmemeval.add_argument(
+        "--extraction-batch-size",
+        type=int,
+        default=1,
+        help="Coalesce this many sessions into one extraction request",
+    )
     longmemeval.add_argument(
         "--retry-failed-sessions",
         action="store_true",
@@ -200,6 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extraction model (or LM_STUDIO_EXTRACTOR_MODEL)",
     )
     longmemeval_qa.add_argument(
+        "--extractor-prompt-version",
+        default=LM_STUDIO_DEFAULT_PROMPT_VERSION,
+        help="Cache-busting extraction prompt version",
+    )
+    longmemeval_qa.add_argument(
         "--reader-model",
         default=os.getenv("LM_STUDIO_READER_MODEL"),
         help="Reader model (or LM_STUDIO_READER_MODEL)",
@@ -223,7 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--reasoning-effort",
         choices=("low", "medium", "high"),
         default=os.getenv("LM_STUDIO_REASONING_EFFORT"),
-        help="Reasoning effort for reader/judge and cache-miss extraction",
+        help="Reasoning effort for extraction and the reader by default",
+    )
+    longmemeval_qa.add_argument(
+        "--reader-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=os.getenv("LM_STUDIO_READER_REASONING_EFFORT"),
+        help="Override reader reasoning without invalidating extraction cache",
     )
     longmemeval_qa.add_argument("--reader-max-tokens", type=int, default=512)
     longmemeval_qa.add_argument("--judge-max-tokens", type=int, default=10)
@@ -234,6 +256,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Maximum number of uncached extraction calls in flight",
+    )
+    longmemeval_qa.add_argument(
+        "--extraction-batch-size",
+        type=int,
+        default=1,
+        help="Coalesce this many short sessions into one extraction request",
     )
     longmemeval_qa.add_argument(
         "--retry-failed-sessions",
@@ -419,19 +447,28 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
             model=extractor_model,
             base_url=args.base_url,
             api_key=args.api_key,
-            prompt_version="lmstudio-fact-extractor-v1",
+            prompt_version=args.extractor_prompt_version,
             reasoning_effort=args.reasoning_effort,
             max_tokens=args.extractor_max_tokens,
+            batch_max_tokens=args.extractor_max_tokens,
+            batch_request_concurrency=max(1, args.extraction_concurrency),
             timeout_seconds=args.timeout,
             retries=args.retries,
             max_session_chars=args.max_session_chars,
         )
     )
+    if args.extraction_batch_size > 1:
+        if not isinstance(extractor, LmStudioFactExtractor):
+            raise SystemExit("--extraction-batch-size requires --extractor lm-studio")
+        extractor = LmStudioBatchFactExtractor(
+            extractor,
+            batch_size=args.extraction_batch_size,
+        )
     reader = LmStudioLongMemEvalReader(
         model=reader_model,
         base_url=args.base_url,
         api_key=args.api_key,
-        reasoning_effort=args.reasoning_effort,
+        reasoning_effort=args.reader_reasoning_effort or args.reasoning_effort,
         max_tokens=args.reader_max_tokens,
         timeout_seconds=args.timeout,
         retries=args.retries,
@@ -489,7 +526,7 @@ def _build_longmemeval_extractor(args: argparse.Namespace):
         return HeuristicFactExtractor()
     if not args.model:
         raise SystemExit("LM Studio extractor requires --model or LM_STUDIO_MODEL.")
-    return LmStudioFactExtractor(
+    extractor = LmStudioFactExtractor(
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
@@ -501,3 +538,9 @@ def _build_longmemeval_extractor(args: argparse.Namespace):
         retries=args.retries,
         max_session_chars=args.max_session_chars,
     )
+    if args.extraction_batch_size > 1:
+        extractor = LmStudioBatchFactExtractor(
+            extractor,
+            batch_size=args.extraction_batch_size,
+        )
+    return extractor

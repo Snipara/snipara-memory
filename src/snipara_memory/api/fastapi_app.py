@@ -30,6 +30,10 @@ class StoreMemoryBody(BaseModel):
     source: str | None = None
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    memory_key: str | None = None
+    supersedes_memory_key: str | None = None
+    provenance_key: str | None = None
+    observed_at: datetime | None = None
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     relevance_boost: float = Field(default=1.0, ge=0.0)
     tier: MemoryTier | None = None
@@ -49,6 +53,13 @@ class RecallBody(BaseModel):
     types: list[MemoryType] = Field(default_factory=list)
     tiers: list[MemoryTier] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    candidate_limit: int | None = Field(default=None, ge=1, le=1000)
+    diversify_by_provenance: bool = False
+    max_per_provenance: int | None = Field(default=None, ge=1, le=1000)
+    deduplicate_evidence: bool = False
+    include_provenance_context: bool = False
+    provenance_context_limit: int | None = Field(default=None, ge=1, le=1000)
+    provenance_context_group_limit: int | None = Field(default=None, ge=1, le=1000)
 
 
 def create_app(service: MemoryService) -> FastAPI:

@@ -36,13 +36,13 @@ from snipara_memory import InMemoryMemoryStore, MemoryService, RecallQuery, Stor
 async def main():
     store = InMemoryMemoryStore()
     service = MemoryService(store=store)
-    
+
     await service.store_memory(StoreMemoryRequest(
         namespace_id="demo",
         content="JWT auth uses RS256 token pairs and refresh tokens.",
         title="Auth convention",
     ))
-    
+
     matches = await service.semantic_recall(
         RecallQuery(namespace_id="demo", query="How do we handle JWT auth?")
     )
@@ -139,22 +139,77 @@ Many tools stop at "store text, run semantic search".
 - graveyard restore instead of destructive deletes
 - session bundles for agent warm-up
 - importers for transcripts and project docs
+- explicit memory identity for safe updates and supersession
+- optional provenance-diverse recall with duplicate-evidence filtering
 
 ## Transcript Store vs Durable Memory
 
-| Need | Transcript-first memory | `snipara-memory` |
-| --- | --- | --- |
-| Keep the original conversation | Strong | Not the main goal |
-| Preserve durable decisions | Usually ad hoc | First-class |
-| Scope memory to projects | Often weak | Built-in |
-| Handle contradictions | Rare | Built-in |
-| Archive without hard delete | Rare | Built-in graveyard |
-| Warm up a new session | Manual | Session bundles |
-| Model memory as typed objects | Limited | Built-in |
+| Need                           | Transcript-first memory | `snipara-memory`   |
+| ------------------------------ | ----------------------- | ------------------ |
+| Keep the original conversation | Strong                  | Not the main goal  |
+| Preserve durable decisions     | Usually ad hoc          | First-class        |
+| Scope memory to projects       | Often weak              | Built-in           |
+| Handle contradictions          | Rare                    | Built-in           |
+| Archive without hard delete    | Rare                    | Built-in graveyard |
+| Warm up a new session          | Manual                  | Session bundles    |
+| Model memory as typed objects  | Limited                 | Built-in           |
 
 If your main problem is "search my old chats", a transcript store may be
 enough. If your main problem is "my agent should keep stable project memory",
 this package is the right layer.
+
+## Evolving memories and evidence diversity
+
+An update should name the durable thing it replaces, not rely on a storage ID
+or append a second value forever:
+
+```python
+await service.store_memory(StoreMemoryRequest(
+    namespace_id="demo",
+    content="The deployment target is production.",
+    memory_key="deployment.target",
+    supersedes_memory_key="deployment.target",
+    provenance_key="handoff-2026-08-21",
+))
+```
+
+The previous observation is moved to the graveyard and remains restorable.
+When a context budget must cover several sources, ask recall for a broader
+candidate pool and opt into provenance diversity:
+
+```python
+RecallQuery(
+    namespace_id="demo",
+    query="deployment target",
+    limit=8,
+    diversify_by_provenance=True,
+    max_per_provenance=2,
+    deduplicate_evidence=True,
+)
+```
+
+When a fact is spread across several turns in the same source, opt into
+provenance context to bring sibling evidence along with the direct hit:
+
+```python
+RecallQuery(
+    namespace_id="demo",
+    query="Where was the coupon redeemed?",
+    limit=8,
+    include_provenance_context=True,
+    provenance_context_limit=8,
+)
+```
+
+Provenance context is bounded and opt-in: it preserves the compact-memory
+model while allowing a later turn to be resolved against an earlier turn from
+the same document, handoff, or conversation. Confidence remains an
+eligibility filter; it does not inflate relevance and cannot make unrelated
+memories outrank direct evidence.
+
+These are generic memory primitives. A benchmark adapter may add query
+expansion, official prompts, or category-specific readers, but the lifecycle
+and evidence selection remain reusable by project-memory clients.
 
 ## Install
 
@@ -346,10 +401,10 @@ The language is open. The managed cognition layer is Snipara.
 
 ## Relationship To Other Repos
 
-| Repo | Role |
-| --- | --- |
-| `Snipara/snipara-server` | Hosted and self-hosted server surface |
-| `alopez3006/snipara-mcp` | Lightweight stdio MCP connector |
+| Repo                     | Role                                     |
+| ------------------------ | ---------------------------------------- |
+| `Snipara/snipara-server` | Hosted and self-hosted server surface    |
+| `alopez3006/snipara-mcp` | Lightweight stdio MCP connector          |
 | `Snipara/snipara-memory` | This open memory schema and local engine |
 
 ## Development

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -32,6 +33,102 @@ from ..ports.store import MemoryStore
 
 CONFIDENCE_DECAY_RATE = 0.01
 MIN_CONFIDENCE = 0.1
+
+
+def provenance_key_for_memory(memory: Memory) -> str:
+    """Return the stable evidence group used by configurable recall diversity.
+
+    Callers can provide an explicit ``provenance_key`` for a session, commit,
+    document section, or other evidence bundle.  Older memories remain
+    compatible through the existing metadata/source/document fields.
+    """
+
+    explicit = memory.provenance_key or memory.metadata.get("provenance_key")
+    if explicit:
+        return str(explicit)
+    source_session = memory.metadata.get("source_session_id")
+    if source_session:
+        return str(source_session)
+    source_id = memory.metadata.get("source_id")
+    if source_id:
+        return str(source_id)
+    if memory.source:
+        return memory.source
+    if memory.document_refs:
+        return memory.document_refs[0]
+    return memory.id
+
+
+def select_diverse_matches(
+    matches: Sequence[RecallMatch],
+    *,
+    limit: int,
+    max_per_provenance: int | None = None,
+    deduplicate_evidence: bool = False,
+) -> list[RecallMatch]:
+    """Select ranked evidence while optionally preserving source diversity.
+
+    The algorithm is intentionally domain-agnostic: it knows only about
+    evidence identity and provenance, not about benchmark categories or query
+    wording.  Ranked matches are visited round-robin by provenance group, so a
+    single verbose source cannot consume the whole context budget.
+    """
+
+    if limit <= 0:
+        return []
+    if max_per_provenance is not None and max_per_provenance <= 0:
+        raise ValueError("max_per_provenance must be positive when provided")
+
+    grouped: dict[str, list[RecallMatch]] = {}
+    seen_hashes: set[str] = set()
+    for match in matches:
+        if deduplicate_evidence:
+            content_hash = match.memory.content_hash
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+        grouped.setdefault(provenance_key_for_memory(match.memory), []).append(match)
+
+    if not grouped:
+        return []
+    if max_per_provenance is None:
+        # Deduplication alone should not reorder ranked evidence.  Diversity
+        # is opt-in through max_per_provenance.
+        if not deduplicate_evidence:
+            return list(matches)[:limit]
+        selected: list[RecallMatch] = []
+        seen_hashes: set[str] = set()
+        for match in matches:
+            if match.memory.content_hash in seen_hashes:
+                continue
+            seen_hashes.add(match.memory.content_hash)
+            selected.append(match)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    selected: list[RecallMatch] = []
+    group_keys = list(grouped)
+    round_index = 0
+    while len(selected) < limit:
+        made_progress = False
+        for group_key in group_keys:
+            group = grouped[group_key]
+            if round_index >= len(group):
+                continue
+            if (
+                max_per_provenance is not None
+                and round_index >= max_per_provenance
+            ):
+                continue
+            selected.append(group[round_index])
+            made_progress = True
+            if len(selected) >= limit:
+                break
+        if not made_progress:
+            break
+        round_index += 1
+    return selected[:limit]
 
 
 def calculate_confidence_decay(
@@ -93,6 +190,7 @@ class MemoryService:
             embedding = await self._embeddings.embed_text(request.content)
 
         created = await self._store.create_memory(memory, embedding=embedding)
+        await self._apply_explicit_supersession([created])
         await self._invalidate_namespace_cache(created.namespace_id)
         return created
 
@@ -119,6 +217,7 @@ class MemoryService:
             ]
 
         created = await self._store.create_memories(memories, embeddings=embeddings)
+        await self._apply_explicit_supersession(created)
         for namespace_id in {request.namespace_id for request in requests}:
             await self._invalidate_namespace_cache(namespace_id)
         return created
@@ -133,12 +232,41 @@ class MemoryService:
         matches sorted by relevance score.
         """
         query_embedding: list[float] | None = None
-        if self._embeddings is not None:
-            query_embedding = await self._embeddings.embed_text(query.query)
+        if query.limit <= 0:
+            raise ValueError("RecallQuery.limit must be positive")
+        if query.candidate_limit is not None and query.candidate_limit < query.limit:
+            raise ValueError("RecallQuery.candidate_limit must be at least limit")
+        if query.max_per_provenance is not None and query.max_per_provenance <= 0:
+            raise ValueError("RecallQuery.max_per_provenance must be positive")
+        if (
+            query.provenance_context_group_limit is not None
+            and query.provenance_context_group_limit <= 0
+        ):
+            raise ValueError(
+                "RecallQuery.provenance_context_group_limit must be positive"
+            )
 
-        matches = await self._store.search(query, query_embedding=query_embedding)
-        now = datetime.now(UTC)
-        filtered: list[RecallMatch] = []
+        query_embedding_text = query.query
+        if self._embeddings is not None:
+            query_embedding = await self._embeddings.embed_text(query_embedding_text)
+
+        candidate_limit = query.candidate_limit
+        if candidate_limit is None and (
+            query.diversify_by_provenance
+            or query.deduplicate_evidence
+            or query.include_provenance_context
+        ):
+            candidate_limit = max(query.limit * 4, query.limit)
+        search_query = replace(
+            query,
+            limit=max(query.limit, candidate_limit or query.limit),
+        )
+        matches = await self._store.search(
+            search_query,
+            query_embedding=query_embedding,
+        )
+        eligible: list[RecallMatch] = []
+        matched_provenance_scores: dict[str, float] = {}
 
         for match in matches:
             decayed_confidence = calculate_confidence_decay(
@@ -149,22 +277,111 @@ class MemoryService:
             if decayed_confidence < query.min_confidence:
                 continue
 
-            touched = replace(
+            scored = replace(
                 match.memory,
                 confidence=decayed_confidence,
+            )
+            scored_match = replace(
+                # Confidence is an eligibility gate, not a relevance score.
+                # Inflating every positive match by its confidence lets an
+                # unrelated high-confidence memory outrank query evidence.
+                match,
+                memory=scored,
+                score=match.score,
+            )
+            eligible.append(scored_match)
+            if query.include_provenance_context:
+                provenance = provenance_key_for_memory(scored)
+                matched_provenance_scores[provenance] = max(
+                    matched_provenance_scores.get(provenance, 0.0),
+                    scored_match.score,
+                )
+
+        if query.include_provenance_context and matched_provenance_scores:
+            existing_ids = {match.memory.id for match in eligible}
+            context_limit = query.provenance_context_limit or max(query.limit, 4)
+            context_group_limit = query.provenance_context_group_limit or max(
+                4, min(16, query.limit // 8 or 1)
+            )
+            selected_provenances = {
+                provenance
+                for provenance, _score in sorted(
+                    matched_provenance_scores.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:context_group_limit]
+            }
+            # Keep direct-hit scores and reasons intact. A weak direct hit
+            # must not be promoted to the anchor score merely because another
+            # memory from the same evidence bundle matched the query; doing
+            # so makes an unrelated sibling outrank concrete query evidence.
+            # Siblings that were not direct hits are added below with the
+            # explicit ``provenance-context`` reason.
+            context_counts: dict[str, int] = defaultdict(int)
+            active_memories = await self._store.list_memories(
+                query.namespace_id,
+                statuses=[MemoryStatus.ACTIVE],
+            )
+            for memory in active_memories:
+                if memory.id in existing_ids:
+                    continue
+                provenance = provenance_key_for_memory(memory)
+                if provenance not in selected_provenances:
+                    continue
+                anchor_score = matched_provenance_scores.get(provenance)
+                if anchor_score is None or context_counts[provenance] >= context_limit:
+                    continue
+                decayed_confidence = calculate_confidence_decay(
+                    memory.confidence,
+                    created_at=memory.created_at,
+                    last_accessed_at=memory.last_accessed_at,
+                )
+                if decayed_confidence < query.min_confidence:
+                    continue
+                context_memory = replace(memory, confidence=decayed_confidence)
+                eligible.append(
+                    RecallMatch(
+                        memory=context_memory,
+                        # Keep sibling evidence in the same relevance band as
+                        # the anchor so a large candidate pool cannot hide it
+                        # behind unrelated direct matches, without making a
+                        # contextual sibling outrank the direct hit.
+                        score=anchor_score,
+                        reason="provenance-context",
+                    )
+                )
+                context_counts[provenance] += 1
+
+        eligible.sort(
+            key=lambda match: (
+                match.score,
+                match.memory.confidence,
+                match.memory.last_accessed_at or match.memory.created_at,
+            ),
+            reverse=True,
+        )
+
+        selected = select_diverse_matches(
+            eligible,
+            limit=query.limit,
+            max_per_provenance=(
+                (query.max_per_provenance or 1)
+                if query.diversify_by_provenance
+                else None
+            ),
+            deduplicate_evidence=query.deduplicate_evidence,
+        )
+        now = datetime.now(UTC)
+        touched_matches: list[RecallMatch] = []
+        for match in selected:
+            touched = replace(
+                match.memory,
                 access_count=match.memory.access_count + 1,
                 last_accessed_at=now,
             )
             await self._store.update_memory(touched)
-            filtered.append(
-                replace(
-                    match,
-                    memory=touched,
-                    score=max(match.score, decayed_confidence),
-                )
-            )
-
-        return filtered[: query.limit]
+            touched_matches.append(replace(match, memory=touched))
+        return touched_matches
 
     async def list_memories(
         self,
@@ -270,6 +487,10 @@ class MemoryService:
             source=memory.source,
             tags=list(memory.tags),
             metadata=dict(memory.metadata),
+            memory_key=memory.memory_key,
+            supersedes_memory_key=memory.supersedes_memory_key,
+            provenance_key=memory.provenance_key,
+            observed_at=memory.observed_at,
             confidence=memory.confidence,
             previous_tier=memory.tier,
             previous_status=memory.status,
@@ -316,6 +537,10 @@ class MemoryService:
             source=entry.source,
             tags=list(entry.tags),
             metadata=dict(entry.metadata),
+            memory_key=entry.memory_key,
+            supersedes_memory_key=entry.supersedes_memory_key,
+            provenance_key=entry.provenance_key,
+            observed_at=entry.observed_at,
             confidence=entry.confidence,
             tier=entry.previous_tier or MemoryTier.ARCHIVE,
             status=MemoryStatus.ACTIVE,
@@ -508,6 +733,57 @@ class MemoryService:
             archived_count=archived_count,
         )
 
+    async def _apply_explicit_supersession(
+        self,
+        created: Sequence[Memory],
+    ) -> tuple[str, ...]:
+        """Apply explicit memory-key replacements through the graveyard.
+
+        Supersession is an ingestion concern, not a benchmark concern.  A
+        caller must opt in by naming the identity it replaces; unrelated facts
+        and repeated evidence remain active.  The local map also handles two
+        successive updates arriving in one bulk import.
+        """
+
+        if not any(
+            memory.memory_key or memory.supersedes_memory_key
+            for memory in created
+        ):
+            return ()
+
+        superseded_ids: list[str] = []
+        for namespace_id in {memory.namespace_id for memory in created}:
+            active = await self._store.list_memories(
+                namespace_id,
+                statuses=[MemoryStatus.ACTIVE],
+            )
+            current_by_key = {
+                memory.memory_key: memory
+                for memory in active
+                if memory.memory_key
+            }
+            for memory in (
+                item for item in created if item.namespace_id == namespace_id
+            ):
+                supersedes_key = memory.supersedes_memory_key
+                if supersedes_key:
+                    previous = current_by_key.get(supersedes_key)
+                    if previous is not None and previous.id != memory.id:
+                        await self.move_to_graveyard(
+                            previous.id,
+                            reason=GraveyardReason.SUPERSEDED,
+                            replaced_by_id=memory.id,
+                            restore_hint=(
+                                "Restore the graveyard entry if the newer observation "
+                                "is later determined to be incorrect."
+                            ),
+                        )
+                        superseded_ids.append(previous.id)
+                    current_by_key[supersedes_key] = memory
+                if memory.memory_key:
+                    current_by_key[memory.memory_key] = memory
+        return tuple(superseded_ids)
+
     def _build_memory(self, request: StoreMemoryRequest) -> Memory:
         now = datetime.now(UTC)
         tier = request.tier or classify_memory_tier(
@@ -527,6 +803,10 @@ class MemoryService:
             source=request.source,
             tags=list(request.tags),
             metadata=dict(request.metadata),
+            memory_key=request.memory_key,
+            supersedes_memory_key=request.supersedes_memory_key,
+            provenance_key=request.provenance_key,
+            observed_at=request.observed_at,
             confidence=request.confidence,
             relevance_boost=request.relevance_boost,
             tier=tier,

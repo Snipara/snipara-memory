@@ -260,6 +260,8 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
         "retrieval_evaluable_count": report.retrieval_evaluable_count,
         "retrieval_hit_count": report.retrieval_hit_count,
         "retrieval_recall_at_k": report.retrieval_recall_at_k,
+        "answer_session_recall_evaluable_count": report.answer_session_recall_evaluable_count,
+        "answer_session_recall_at_k": report.answer_session_recall_at_k,
         "categories": [
             {
                 "category": category.category,
@@ -271,6 +273,8 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "retrieval_evaluable_count": category.retrieval_evaluable_count,
                 "retrieval_hit_count": category.retrieval_hit_count,
                 "retrieval_recall_at_k": category.retrieval_recall_at_k,
+                "answer_session_recall_evaluable_count": category.answer_session_recall_evaluable_count,
+                "answer_session_recall_at_k": category.answer_session_recall_at_k,
             }
             for category in report.categories
         ],
@@ -285,6 +289,7 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                     question.retrieved_answer_session_ids
                 ),
                 "retrieval_hit_at_k": question.retrieval_hit_at_k,
+                "answer_session_recall_at_k": question.answer_session_recall_at_k,
                 "reader_response": question.reader_response,
                 "judge_response": question.judge_response,
                 "judge_label": question.judge_label,
@@ -316,7 +321,8 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
         f"Questions: {report.question_count}",
         f"Scored: {report.scored_count} ({report.coverage:.3f} coverage)",
         f"Accuracy: {report.accuracy:.3f}",
-        f"Answer-session recall@{report.retrieval_k}: {report.retrieval_recall_at_k:.3f}",
+        f"Answer-session hit rate@{report.retrieval_k}: {report.retrieval_recall_at_k:.3f}",
+        f"Answer-session recall@{report.retrieval_k}: {report.answer_session_recall_at_k:.3f}",
         f"Reader cache hits/misses: {report.reader_cache_hits}/{report.reader_cache_misses}",
         f"Judge cache hits/misses: {report.judge_cache_hits}/{report.judge_cache_misses}",
         f"Failed ingestion sessions: {report.ingestion_failed_session_count}",
@@ -326,7 +332,8 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
     lines.extend(
         f"- {category.category}: {category.correct_count}/{category.scored_count} "
         f"accuracy={category.accuracy:.3f}; "
-        f"retrieval@{report.retrieval_k}={category.retrieval_recall_at_k:.3f}; "
+        f"hit-rate@{report.retrieval_k}={category.retrieval_recall_at_k:.3f}; "
+        f"answer-recall@{report.retrieval_k}={category.answer_session_recall_at_k:.3f}; "
         f"{category.question_count} questions"
         for category in report.categories
     )

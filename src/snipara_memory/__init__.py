@@ -26,6 +26,8 @@ from .domain import (
     StoreMemoryRequest,
     calculate_confidence_decay,
     classify_memory_tier,
+    provenance_key_for_memory,
+    select_diverse_matches,
 )
 from .ports import CacheStore, EmbeddingsProvider, MemoryStore
 from .longmemeval import (
@@ -33,6 +35,7 @@ from .longmemeval import (
     ExtractionCache,
     FactExtractor,
     HeuristicFactExtractor,
+    LmStudioBatchFactExtractor,
     LmStudioFactExtractor,
     LongMemEvalIngestionReport,
     LongMemEvalIngestionResult,
@@ -77,6 +80,7 @@ __all__ = [
     "FactExtractor",
     "GraveyardEntry",
     "HeuristicFactExtractor",
+    "LmStudioBatchFactExtractor",
     "LmStudioFactExtractor",
     "GraveyardReason",
     "InMemoryMemoryStore",
@@ -109,6 +113,8 @@ __all__ = [
     "__version__",
     "calculate_confidence_decay",
     "classify_memory_tier",
+    "provenance_key_for_memory",
+    "select_diverse_matches",
     "create_app",
     "get_default_store_path",
     "ingest_longmemeval_dataset",

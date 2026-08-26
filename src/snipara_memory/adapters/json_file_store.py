@@ -161,6 +161,10 @@ def _memory_from_dict(data: dict[str, Any]) -> Memory:
         source=data.get("source"),
         tags=list(data.get("tags", [])),
         metadata=dict(data.get("metadata", {})),
+        memory_key=data.get("memory_key"),
+        supersedes_memory_key=data.get("supersedes_memory_key"),
+        provenance_key=data.get("provenance_key"),
+        observed_at=_parse_datetime(data.get("observed_at")),
         confidence=float(data.get("confidence", 1.0)),
         relevance_boost=float(data.get("relevance_boost", 1.0)),
         access_count=int(data.get("access_count", 0)),
@@ -206,6 +210,10 @@ def _graveyard_entry_from_dict(data: dict[str, Any]) -> GraveyardEntry:
         source=data.get("source"),
         tags=list(data.get("tags", [])),
         metadata=dict(data.get("metadata", {})),
+        memory_key=data.get("memory_key"),
+        supersedes_memory_key=data.get("supersedes_memory_key"),
+        provenance_key=data.get("provenance_key"),
+        observed_at=_parse_datetime(data.get("observed_at")),
         confidence=float(data.get("confidence", 1.0)),
         previous_tier=(
             MemoryTier(data["previous_tier"])

@@ -153,7 +153,7 @@ def extract_transcript_requests(
     seen: set[str] = set()
     requests: list[StoreMemoryRequest] = []
 
-    for message in messages:
+    for message_index, message in enumerate(messages):
         for sentence in _split_sentences(message.content):
             content = _clean_chunk(sentence)
             if len(content) < 30:
@@ -174,7 +174,12 @@ def extract_transcript_requests(
                     scope=MemoryScope.PROJECT,
                     source=source,
                     tags=["imported", "transcript", message.role],
-                    metadata={"speaker": message.role, "import_source": source},
+                    provenance_key=source,
+                    metadata={
+                        "speaker": message.role,
+                        "source_turn_index": message_index,
+                        "import_source": source,
+                    },
                     confidence=confidence,
                 )
             )
@@ -214,6 +219,7 @@ def extract_project_requests(
                     scope=MemoryScope.PROJECT,
                     source=str(file_path),
                     tags=["imported", "project", file_path.suffix.lower().lstrip(".")],
+                    provenance_key=str(file_path),
                     metadata={"path": str(file_path), "import_source": "project"},
                     confidence=confidence,
                 )

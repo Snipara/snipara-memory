@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from collections import Counter
 
 from ..domain import Contradiction, GraveyardEntry, Memory, MemoryStatus, MemoryTier, MemoryType, RecallMatch, RecallQuery
 
@@ -55,8 +56,24 @@ class InMemoryMemoryStore:
             tiers=query.tiers,
             tags=query.tags,
         )
+        query_terms = self._tokenize(query.query)
+        document_frequency = Counter(
+            term
+            for memory in candidates
+            for term in self._memory_terms(memory)
+            if term in query_terms
+        )
         matches = [
-            RecallMatch(memory=memory, score=self._score(memory, query.query, query_embedding))
+            RecallMatch(
+                memory=memory,
+                score=self._score(
+                    memory,
+                    query.query,
+                    query_embedding,
+                    document_frequency=document_frequency,
+                    document_count=len(candidates),
+                ),
+            )
             for memory in candidates
         ]
         matches = [match for match in matches if match.score > 0]
@@ -168,17 +185,35 @@ class InMemoryMemoryStore:
         memory: Memory,
         query: str,
         query_embedding: Sequence[float] | None,
+        *,
+        document_frequency: Counter[str] | None = None,
+        document_count: int = 0,
     ) -> float:
         if query_embedding is not None and memory.id in self._embeddings:
             return self._cosine_similarity(query_embedding, self._embeddings[memory.id])
 
         query_terms = self._tokenize(query)
-        memory_terms = self._tokenize(memory.content)
+        memory_terms = self._memory_terms(memory)
         if not query_terms or not memory_terms:
             return 0.0
 
-        overlap = len(query_terms & memory_terms)
-        return overlap / max(len(query_terms), 1)
+        overlap = query_terms & memory_terms
+        if not overlap:
+            return 0.0
+        if not document_frequency or document_count <= 0:
+            return len(overlap) / max(len(query_terms), 1)
+        weights = {
+            term: math.log((document_count + 1) / (document_frequency[term] + 1)) + 1
+            for term in query_terms
+        }
+        return sum(weights[term] for term in overlap) / sum(weights.values())
+
+    def _memory_terms(self, memory: Memory) -> set[str]:
+        return (
+            self._tokenize(memory.content)
+            | self._tokenize(memory.title or "")
+            | {tag.lower() for tag in memory.tags}
+        )
 
     def _pair_similarity(self, memory_a: Memory, memory_b: Memory) -> float:
         embedding_a = self._embeddings.get(memory_a.id)
