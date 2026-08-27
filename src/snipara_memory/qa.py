@@ -37,7 +37,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v23"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v24"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -86,6 +86,10 @@ Reasoning rules:
   When an action_item_checklist is supplied, use it as the explicit inventory
   of qualifying records: duplicate entries with the same session, action, and
   item are one record, while pickup and return entries are separate records.
+  For a non-count multi-session question, make a short pass over every
+  session_group before drafting the answer. The group is an evidence bundle,
+  not a ranking hint: a lower-ranked fact from a distinct session can be one
+  of the required answer parts.
 - For temporal questions, sort relevant sessions by session_date, use an
   explicit temporal_anchor when present, and calculate the requested interval
   or order. Treat session_date as the event date only when the evidence places
@@ -344,7 +348,25 @@ def _resolution_record(memory: Mapping[str, Any]) -> dict[str, Any]:
         "evidence_kind": memory.get("evidence_kind"),
         "fact_key": memory.get("fact_key"),
         "temporal_anchor": memory.get("temporal_anchor"),
+        "source_turn_indices": _source_turn_indices(memory),
     }
+
+
+def _source_turn_indices(memory: Mapping[str, Any]) -> list[int]:
+    """Return bounded, validated transcript provenance for reader evidence."""
+
+    raw_indices = memory.get("source_turn_indices", [])
+    if not isinstance(raw_indices, (list, tuple)):
+        return []
+    indices: list[int] = []
+    for raw_index in raw_indices[:16]:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if index >= 0:
+            indices.append(index)
+    return indices
 
 
 def _resolution_reference(memory: Mapping[str, Any]) -> dict[str, Any]:
@@ -384,6 +406,7 @@ def _resolution_evidence_snippet(
         "session_date": memory.get("session_date"),
         "title": memory.get("title"),
         "content": content,
+        "source_turn_indices": _source_turn_indices(memory),
     }
 
 
@@ -821,6 +844,46 @@ def _deterministic_resolution_audit(
             ],
         }
 
+    if question_type == "multi-session":
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for memory in context:
+            session_id = str(memory.get("source_session_id") or "unknown")
+            grouped.setdefault(session_id, []).append(memory)
+        bundles: list[dict[str, Any]] = []
+        for session_id, memories in grouped.items():
+            user_evidence_ranks = [
+                int(memory["rank"])
+                for memory in memories
+                if memory.get("explicit_user_evidence")
+                or memory.get("evidence_kind")
+                in {"user_fact", "preference", "decision", "event", "context"}
+            ]
+            bundles.append(
+                {
+                    "source_session_id": session_id,
+                    "session_date": memories[0].get("session_date"),
+                    "memory_ranks": [int(memory["rank"]) for memory in memories],
+                    "user_evidence_ranks": user_evidence_ranks,
+                    "memory_count": len(memories),
+                }
+            )
+        bundles.sort(
+            key=lambda bundle: (
+                str(bundle.get("session_date") or ""),
+                str(bundle.get("source_session_id") or ""),
+            )
+        )
+        return {
+            "kind": "multi_session",
+            "distinct_session_count": len(bundles),
+            "session_bundles": bundles,
+            "instructions": [
+                "Inspect every session bundle before answering.",
+                "Combine distinct answer contributions and deduplicate only repeated evidence within the same session.",
+                "Do not let the highest-ranked session stand in for another session.",
+            ],
+        }
+
     return {"kind": "none"}
 
 
@@ -1016,6 +1079,7 @@ class LmStudioLongMemEvalReader:
                     getattr(match.memory, "supersedes_memory_key", None)
                     or match.memory.metadata.get("supersedes_fact_key")
                 ),
+                "source_turn_indices": _source_turn_indices(match.memory.metadata),
                 "evidence_kind": match.memory.metadata.get("evidence_kind"),
                 "explicit_user_evidence": match.memory.metadata.get(
                     "explicit_user_evidence", False
@@ -1038,9 +1102,17 @@ class LmStudioLongMemEvalReader:
             session_groups.append(
                 {
                     "source_session_id": session_id,
+                    "session_date": session_memories[0].get("session_date"),
                     "memory_count": len(session_memories),
                     "memory_ranks": [memory["rank"] for memory in session_memories],
                     "memory_titles": [memory.get("title") for memory in session_memories],
+                    "user_evidence_ranks": [
+                        memory["rank"]
+                        for memory in session_memories
+                        if memory.get("explicit_user_evidence")
+                        or memory.get("evidence_kind")
+                        in {"user_fact", "preference", "decision", "event", "context"}
+                    ],
                 }
             )
         action_item_checklist = _action_item_checklist(question, context)
@@ -1365,6 +1437,11 @@ class LongMemEvalQAResult:
     status: str
     failed_stage: str | None = None
     failure_message: str | None = None
+    ingestion_failed_session_count: int = 0
+
+    @property
+    def ingestion_complete(self) -> bool:
+        return self.ingestion_failed_session_count == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1378,10 +1455,21 @@ class LongMemEvalCategoryReport:
     retrieval_hit_count: int
     answer_session_recall_evaluable_count: int
     answer_session_recall_sum: float
+    partial_ingestion_count: int
+    clean_scored_count: int
+    clean_correct_count: int
 
     @property
     def accuracy(self) -> float:
         return self.correct_count / self.scored_count if self.scored_count else 0.0
+
+    @property
+    def clean_accuracy(self) -> float:
+        return (
+            self.clean_correct_count / self.clean_scored_count
+            if self.clean_scored_count
+            else 0.0
+        )
 
     @property
     def retrieval_recall_at_k(self) -> float:
@@ -1415,10 +1503,14 @@ class LongMemEvalQAReport:
     judge_cache_hits: int
     judge_cache_misses: int
     ingestion_failed_session_count: int
+    session_count: int
     retrieval_evaluable_count: int
     retrieval_hit_count: int
     answer_session_recall_evaluable_count: int
     answer_session_recall_sum: float
+    clean_scored_count: int
+    clean_correct_count: int
+    partial_ingestion_count: int
     categories: tuple[LongMemEvalCategoryReport, ...]
     questions: tuple[LongMemEvalQAResult, ...]
 
@@ -1429,6 +1521,34 @@ class LongMemEvalQAReport:
     @property
     def coverage(self) -> float:
         return self.scored_count / self.question_count if self.question_count else 0.0
+
+    @property
+    def clean_accuracy(self) -> float:
+        """Accuracy over judged questions whose ingestion was complete."""
+
+        return (
+            self.clean_correct_count / self.clean_scored_count
+            if self.clean_scored_count
+            else 0.0
+        )
+
+    @property
+    def strict_accuracy(self) -> float:
+        """Alias used by validation/reporting for the clean benchmark score."""
+
+        return self.clean_accuracy
+
+    @property
+    def ingestion_coverage(self) -> float:
+        """Fraction of expected sessions extracted without a recorded failure."""
+
+        if not self.session_count:
+            return 0.0
+        return max(
+            0.0,
+            (self.session_count - self.ingestion_failed_session_count)
+            / self.session_count,
+        )
 
     @property
     def retrieval_recall_at_k(self) -> float:
@@ -1492,6 +1612,9 @@ def _retrieval_input_hash(
                 "memory_type": match.memory.type.value,
                 "session_date": match.memory.metadata.get("source_session_date"),
                 "fact_key": match.memory.metadata.get("fact_key"),
+                "source_session_id": match.memory.metadata.get("source_session_id"),
+                "source_turn_indices": _source_turn_indices(match.memory.metadata),
+                "evidence_kind": match.memory.metadata.get("evidence_kind"),
             }
             for index, match in enumerate(matches)
         ],
@@ -1645,6 +1768,7 @@ async def run_longmemeval_qa(
                         status="failed",
                         failed_stage="reader",
                         failure_message=f"{type(error).__name__}: {str(error)[:500]}",
+                        ingestion_failed_session_count=len(ingestion.failed_session_ids),
                     )
                 )
                 if qa_cache:
@@ -1696,6 +1820,7 @@ async def run_longmemeval_qa(
                         status="failed",
                         failed_stage="judge",
                         failure_message=f"{type(error).__name__}: {str(error)[:500]}",
+                        ingestion_failed_session_count=len(ingestion.failed_session_ids),
                     )
                 )
                 if qa_cache:
@@ -1727,13 +1852,25 @@ async def run_longmemeval_qa(
                 reader_response=reader_response,
                 judge_response=judge_response,
                 judge_label=judge_label,
-                status="scored",
+                status=(
+                    "partial-ingestion"
+                    if ingestion.failed_session_ids
+                    else "scored"
+                ),
+                ingestion_failed_session_count=len(ingestion.failed_session_ids),
             )
         )
 
     categories = _build_category_reports(results)
     correct_count = sum(1 for result in results if result.judge_label is True)
     scored_count = sum(1 for result in results if result.judge_label is not None)
+    clean_scored_count = sum(
+        result.judge_label is not None and result.ingestion_complete
+        for result in results
+    )
+    clean_correct_count = sum(
+        result.judge_label is True and result.ingestion_complete for result in results
+    )
     return LongMemEvalQAReport(
         dataset=str(dataset_path),
         question_count=len(results),
@@ -1747,6 +1884,7 @@ async def run_longmemeval_qa(
         judge_cache_hits=judge_cache_hits,
         judge_cache_misses=judge_cache_misses,
         ingestion_failed_session_count=ingestion_failed_session_count,
+        session_count=sum(len(question.sessions) for question in questions),
         retrieval_evaluable_count=sum(
             result.retrieval_hit_at_k is not None for result in results
         ),
@@ -1758,6 +1896,11 @@ async def run_longmemeval_qa(
         ),
         answer_session_recall_sum=sum(
             result.answer_session_recall_at_k or 0.0 for result in results
+        ),
+        clean_scored_count=clean_scored_count,
+        clean_correct_count=clean_correct_count,
+        partial_ingestion_count=sum(
+            result.ingestion_failed_session_count > 0 for result in results
         ),
         categories=tuple(categories),
         questions=tuple(results),
@@ -2064,6 +2207,17 @@ def _build_category_reports(
             ),
             answer_session_recall_sum=sum(
                 item.answer_session_recall_at_k or 0.0 for item in group
+            ),
+            partial_ingestion_count=sum(
+                item.ingestion_failed_session_count > 0 for item in group
+            ),
+            clean_scored_count=sum(
+                item.judge_label is not None and item.ingestion_complete
+                for item in group
+            ),
+            clean_correct_count=sum(
+                item.judge_label is True and item.ingestion_complete
+                for item in group
             ),
         )
         for category, group in sorted(grouped.items())

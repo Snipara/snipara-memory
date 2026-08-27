@@ -115,10 +115,11 @@ and supersession keys. The dataset's `has_answer` evaluation labels are
 deliberately omitted from the model input. `--prompt-version` and the model
 identifier are part of the cache key, so changing either starts a fresh
 extraction pass while preserving the previous cache for comparison.
-The v3 prompt scans explicit user statements before assistant advice, limits
-each response to eight high-value facts, and records evidence kind and temporal
-anchors. The cache is flushed after every session, so an interrupted run can
-resume without losing the completed tail.
+The extraction prompt scans explicit user statements before assistant advice,
+preserves source turn indices, limits each response to a bounded set of
+high-value facts, and records evidence kind and temporal anchors. The cache is
+flushed after every session, so an interrupted run can resume without losing
+the completed tail.
 Transport failures and malformed structured responses are retried with a
 bounded backoff; when the model truncates the JSON tail, complete fact objects
 before the truncation are retained and marked in metadata. For
@@ -192,10 +193,24 @@ snipara-memory longmemeval-qa \
 
 The JSON report contains overall accuracy and coverage, cache hit/miss counts,
 failed stages, reader outputs, raw judge outputs, answer-session recall@k, and
-accuracy/retrieval recall by question category. `--hypotheses` writes the
-upstream evaluator format with one `question_id`/`hypothesis` object per line.
-The answer-session recall metric uses the benchmark's `answer_session_ids` only
-for diagnosis; those labels are never sent to the reader.
+accuracy/retrieval recall by question category. It also separates
+`clean_accuracy`/`strict_accuracy` (only questions whose every session was
+ingested) from the diagnostic `accuracy` over all judged questions. A result
+with one or more failed extraction sessions is marked `partial-ingestion` and
+must not be presented as a clean benchmark score. `ingestion_coverage` is the
+session-level extraction coverage, while `partial_ingestion_count` is the
+number of affected questions. `--hypotheses` writes the upstream evaluator
+format with one `question_id`/`hypothesis` object per line. The answer-session
+recall metric uses the benchmark's `answer_session_ids` only for diagnosis;
+those labels are never sent to the reader.
+
+For a publishable 500-question run, use
+`benchmarks/longmemeval/validate_final_supervised.py` after rebuilding the
+report. It requires 500 questions, complete extraction hashes, complete
+reader/judge outputs, zero failed sessions, and zero partial-ingestion
+questions. Pass the exact extractor prompt version and reasoning suffix used
+for the cache, for example `--extractor-prompt-version
+lmstudio-fact-extractor-v3 --reasoning-effort low`.
 
 The judge prompt is kept in code as a versioned adapter of
 `src/evaluation/evaluate_qa.py` from the upstream LongMemEval repository. A

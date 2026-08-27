@@ -249,6 +249,11 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
         "correct_count": report.correct_count,
         "accuracy": report.accuracy,
         "coverage": report.coverage,
+        "clean_scored_count": report.clean_scored_count,
+        "clean_correct_count": report.clean_correct_count,
+        "clean_accuracy": report.clean_accuracy,
+        "strict_accuracy": report.strict_accuracy,
+        "partial_ingestion_count": report.partial_ingestion_count,
         "retrieval_k": report.retrieval_k,
         "reader_model": report.reader_model,
         "judge_model": report.judge_model,
@@ -257,6 +262,8 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
         "judge_cache_hits": report.judge_cache_hits,
         "judge_cache_misses": report.judge_cache_misses,
         "ingestion_failed_session_count": report.ingestion_failed_session_count,
+        "session_count": report.session_count,
+        "ingestion_coverage": report.ingestion_coverage,
         "retrieval_evaluable_count": report.retrieval_evaluable_count,
         "retrieval_hit_count": report.retrieval_hit_count,
         "retrieval_recall_at_k": report.retrieval_recall_at_k,
@@ -270,6 +277,10 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "correct_count": category.correct_count,
                 "failed_count": category.failed_count,
                 "accuracy": category.accuracy,
+                "partial_ingestion_count": category.partial_ingestion_count,
+                "clean_scored_count": category.clean_scored_count,
+                "clean_correct_count": category.clean_correct_count,
+                "clean_accuracy": category.clean_accuracy,
                 "retrieval_evaluable_count": category.retrieval_evaluable_count,
                 "retrieval_hit_count": category.retrieval_hit_count,
                 "retrieval_recall_at_k": category.retrieval_recall_at_k,
@@ -294,6 +305,8 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "judge_response": question.judge_response,
                 "judge_label": question.judge_label,
                 "status": question.status,
+                "ingestion_failed_session_count": question.ingestion_failed_session_count,
+                "ingestion_complete": question.ingestion_complete,
                 "failed_stage": question.failed_stage,
                 "failure_message": question.failure_message,
             }
@@ -320,18 +333,23 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
         f"Dataset: {report.dataset}",
         f"Questions: {report.question_count}",
         f"Scored: {report.scored_count} ({report.coverage:.3f} coverage)",
-        f"Accuracy: {report.accuracy:.3f}",
+        f"Accuracy (all judged): {report.accuracy:.3f}",
+        f"Accuracy (clean ingestion): {report.clean_accuracy:.3f} ({report.clean_scored_count} judged)",
         f"Answer-session hit rate@{report.retrieval_k}: {report.retrieval_recall_at_k:.3f}",
         f"Answer-session recall@{report.retrieval_k}: {report.answer_session_recall_at_k:.3f}",
         f"Reader cache hits/misses: {report.reader_cache_hits}/{report.reader_cache_misses}",
         f"Judge cache hits/misses: {report.judge_cache_hits}/{report.judge_cache_misses}",
         f"Failed ingestion sessions: {report.ingestion_failed_session_count}",
+        f"Partial-ingestion questions: {report.partial_ingestion_count}",
+        f"Ingestion coverage: {report.ingestion_coverage:.3f}",
         "",
         "By category:",
     ]
     lines.extend(
         f"- {category.category}: {category.correct_count}/{category.scored_count} "
         f"accuracy={category.accuracy:.3f}; "
+        f"clean={category.clean_correct_count}/{category.clean_scored_count} "
+        f"clean-accuracy={category.clean_accuracy:.3f}; "
         f"hit-rate@{report.retrieval_k}={category.retrieval_recall_at_k:.3f}; "
         f"answer-recall@{report.retrieval_k}={category.answer_session_recall_at_k:.3f}; "
         f"{category.question_count} questions"

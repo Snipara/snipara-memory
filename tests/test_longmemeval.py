@@ -837,7 +837,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v23" in reader.version
+    assert ":lmstudio-longmemeval-reader-v24" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
 
@@ -1067,6 +1067,83 @@ async def test_qa_pipeline_retrieves_reads_judges_and_replays_cache(
         input_hash="wrong",
         reader_version="fake-reader-v1",
     ) is None
+
+
+async def test_qa_marks_judged_results_with_partial_ingestion(tmp_path: Path) -> None:
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([_question_payload()]), encoding="utf-8")
+
+    class PartialExtractor:
+        version = "partial-extractor-v1"
+
+        async def extract(self, session) -> list[ExtractedFact]:
+            if session.session_id == "session-1":
+                raise RuntimeError("simulated extraction outage")
+            return [
+                ExtractedFact(
+                    content="The user now lives in Zurich.",
+                    fact_key="user-city",
+                    source_turn_indices=(0,),
+                    metadata={"evidence_kind": "user_fact"},
+                )
+            ]
+
+    report = await run_longmemeval_qa(
+        dataset,
+        PartialExtractor(),
+        FakeReader(),
+        FakeJudge(),
+        limit=1,
+        retrieval_k=3,
+    )
+
+    result = report.questions[0]
+    assert report.accuracy == 1.0
+    assert report.clean_scored_count == 0
+    assert report.clean_accuracy == 0.0
+    assert report.partial_ingestion_count == 1
+    assert report.ingestion_failed_session_count == 1
+    assert report.session_count == 2
+    assert report.ingestion_coverage == 0.5
+    assert result.status == "partial-ingestion"
+    assert result.ingestion_complete is False
+    assert result.ingestion_failed_session_count == 1
+
+
+async def test_reader_payload_preserves_turn_provenance_and_session_bundle() -> None:
+    memory = SimpleNamespace(
+        title="Current city",
+        content="The user now lives in Zurich.",
+        type=MemoryType.FACT,
+        metadata={
+            "source_session_date": "2024-05-01",
+            "source_session_id": "session-2",
+            "source_turn_indices": [3],
+            "question_type": "multi-session",
+            "fact_key": "user.city",
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+        },
+        observed_at=None,
+    )
+    match = SimpleNamespace(memory=memory, score=1.0)
+    captured: dict[str, Any] = {}
+
+    with _json_server(
+        {"choices": [{"message": {"content": "Zurich"}}]}
+    ) as server:
+        reader = LmStudioLongMemEvalReader(
+            model="reader-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            retries=0,
+        )
+        await reader.answer("What city did I mention?", [match])
+        captured = json.loads(server.requests[0]["messages"][1]["content"])
+
+    assert captured["retrieved_memories"][0]["source_turn_indices"] == [3]
+    assert captured["session_groups"][0]["user_evidence_ranks"] == [1]
+    assert captured["deterministic_resolution_audit"]["kind"] == "multi_session"
+    assert captured["deterministic_resolution_audit"]["distinct_session_count"] == 1
 
 
 async def test_qa_retrieval_keeps_distinct_sessions_for_multi_session_questions(
