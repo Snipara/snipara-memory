@@ -165,6 +165,11 @@ evidence from distinct sessions for multi-session, temporal, and update
 questions. Reader and judge outputs are cached independently so an interrupted
 run can resume without repeating completed calls.
 
+The supervised runner uses a 3600-second per-question wall-time budget by
+default because a single LongMemEval item can contain more than 50 sessions.
+If a process is interrupted or times out, its completed session extractions
+remain durable and the next pass resumes from that cache.
+
 ```bash
 snipara-memory longmemeval-qa \
   /path/to/longmemeval_s_cleaned.json \

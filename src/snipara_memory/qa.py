@@ -37,7 +37,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v24"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v25"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -96,11 +96,19 @@ Reasoning rules:
   the event in that session.
 - For preference questions, use the user's stated preferences and constraints
   to answer or personalize the recommendation; do not substitute generic advice.
+  Preserve explicit qualifiers such as recent, upcoming, local, budget, or
+  technical constraints. Do not present an old or foundational item as recent
+  merely because it is relevant. If the retrieved evidence only supports an
+  older or broader recommendation, state that limitation instead of silently
+  relaxing the user's qualifier.
 - For an unanswerable question, require direct evidence for the exact entity or
   attribute asked about. A related object, hobby, category, or assistant answer
   is not evidence that the user stated the requested fact. For example, a
   camera collection does not establish a film collection; say the information
   cannot be determined when only the related object is supported.
+  Do not assemble a compound object or attribute by taking one modifier from
+  one memory and its head noun from another. The exact relation must be stated
+  in one memory or in explicitly linked evidence from the same conversation.
 - The payload may include a deterministic_resolution_audit. Treat it as an
   evidence-organizing aid, not as a gold answer: verify it against the
   retrieved memories. For an update, compare the ISO-like session_date values
@@ -881,6 +889,39 @@ def _deterministic_resolution_audit(
                 "Inspect every session bundle before answering.",
                 "Combine distinct answer contributions and deduplicate only repeated evidence within the same session.",
                 "Do not let the highest-ranked session stand in for another session.",
+            ],
+        }
+
+    if question_type == "single-session-preference":
+        preference_kinds = {
+            "user_fact",
+            "preference",
+            "decision",
+            "event",
+            "context",
+        }
+        preference_evidence = [
+            memory
+            for memory in context
+            if memory.get("explicit_user_evidence")
+            or memory.get("evidence_kind") in preference_kinds
+        ]
+        temporal_qualifiers = [
+            qualifier
+            for qualifier in ("recent", "upcoming", "latest", "newest")
+            if qualifier in lowered
+        ]
+        return {
+            "kind": "preference",
+            "temporal_qualifiers": temporal_qualifiers,
+            "preference_evidence": [
+                _resolution_compact_record(memory, max_content_chars=220)
+                for memory in preference_evidence[:8]
+            ],
+            "instructions": [
+                "Use the user's stated interest as a hard personalization constraint.",
+                "Preserve temporal and technical qualifiers from the question when selecting or describing recommendations.",
+                "Do not invent unsupported current recommendations when the evidence is only historical.",
             ],
         }
 

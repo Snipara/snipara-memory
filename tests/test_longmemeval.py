@@ -837,7 +837,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v24" in reader.version
+    assert ":lmstudio-longmemeval-reader-v25" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
 
@@ -874,6 +874,28 @@ def test_action_item_checklist_keeps_exchange_actions_distinct() -> None:
         {"source_session_id": "session-3", "action": "pickup", "item": "boots"},
         {"source_session_id": "session-3", "action": "return", "item": "boots"},
     ]
+
+
+def test_preference_resolution_audit_preserves_temporal_qualifiers() -> None:
+    audit = _deterministic_resolution_audit(
+        "Can you recommend some recent publications?",
+        [
+            {
+                "rank": 1,
+                "source_session_id": "session-1",
+                "session_date": "2024-01-01",
+                "question_type": "single-session-preference",
+                "title": "User research interest",
+                "content": "The user is interested in explainable AI for medical imaging.",
+                "evidence_kind": "preference",
+                "explicit_user_evidence": True,
+            }
+        ],
+    )
+
+    assert audit["kind"] == "preference"
+    assert audit["temporal_qualifiers"] == ["recent"]
+    assert audit["preference_evidence"][0]["source_turn_indices"] == []
 
 
 def test_high_signal_augmentation_preserves_later_user_updates() -> None:
