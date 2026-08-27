@@ -561,6 +561,7 @@ def test_lm_studio_version_changes_when_model_or_prompt_changes() -> None:
     base = LmStudioFactExtractor(model="model-a")
 
     assert base.version == "model-a:lmstudio-fact-extractor-v4"
+    assert base.max_session_chars == 12000
     assert LmStudioFactExtractor(model="model-b").version != base.version
     assert (
         LmStudioFactExtractor(

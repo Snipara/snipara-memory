@@ -756,7 +756,11 @@ class LmStudioFactExtractor:
     max_tokens: int = 2048
     timeout_seconds: float = 120.0
     retries: int = 2
-    max_session_chars: int = 24000
+    # Keep transcript input below the context budget once the system prompt,
+    # JSON schema, and requested output tokens are included.  12k characters
+    # is a safe default for the common 8k-context LM Studio setup; callers can
+    # raise it explicitly when using a larger context window.
+    max_session_chars: int = 12000
     batch_request_size: int = 4
     # Keep enough room for the system prompt and the structured response in
     # an 16k-context local model.  A smaller grouping limit also lets the

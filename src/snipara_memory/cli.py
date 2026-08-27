@@ -143,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     longmemeval.add_argument("--temperature", type=float, default=0.0)
     longmemeval.add_argument("--max-tokens", type=int, default=2048)
-    longmemeval.add_argument("--max-session-chars", type=int, default=24000)
+    longmemeval.add_argument("--max-session-chars", type=int, default=12000)
     longmemeval.add_argument("--extraction-concurrency", type=int, default=1)
     longmemeval.add_argument(
         "--extraction-batch-size",
@@ -250,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval_qa.add_argument("--reader-max-tokens", type=int, default=512)
     longmemeval_qa.add_argument("--judge-max-tokens", type=int, default=10)
     longmemeval_qa.add_argument("--extractor-max-tokens", type=int, default=4096)
-    longmemeval_qa.add_argument("--max-session-chars", type=int, default=24000)
+    longmemeval_qa.add_argument("--max-session-chars", type=int, default=12000)
     longmemeval_qa.add_argument(
         "--extraction-concurrency",
         type=int,

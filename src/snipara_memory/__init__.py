@@ -1,9 +1,9 @@
 """Public package exports for snipara-memory."""
 
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 from .adapters import InMemoryMemoryStore, JsonFileMemoryStore, get_default_store_path
-from .api import create_app
 from .domain import (
     CompactionResult,
     Contradiction,
@@ -62,6 +62,21 @@ from .qa import (
     stratified_longmemeval_question_ids,
     write_longmemeval_hypotheses,
 )
+
+
+def create_app(service: MemoryService) -> Any:
+    """Create the optional FastAPI application on demand.
+
+    Core memory, ingestion, and QA consumers should not need to import the
+    web framework just to import ``snipara_memory``.  The package still keeps
+    FastAPI as an installation dependency for the API entry point, while this
+    lazy boundary makes source checkouts and lightweight library use robust
+    when only the core dependencies are available.
+    """
+
+    from .api import create_app as _create_app
+
+    return _create_app(service)
 
 try:
     __version__ = version("snipara-memory")
