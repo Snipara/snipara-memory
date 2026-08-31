@@ -37,7 +37,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v27"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v28"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -104,6 +104,10 @@ Reasoning rules:
   merely because it is relevant. If the retrieved evidence only supports an
   older or broader recommendation, state that limitation instead of silently
   relaxing the user's qualifier.
+  Keep the response scoped to the subject asked about. Do not add unrelated
+  recommendations (such as travel, transportation, or hobbies) just because
+  those memories are recent or highly ranked. Relevance to the question wins
+  over recency.
 - For an unanswerable question, require direct evidence for the exact entity or
   attribute asked about. A related object, hobby, category, or assistant answer
   is not evidence that the user stated the requested fact. For example, a
@@ -118,6 +122,11 @@ Reasoning rules:
   and replace the relationship with the wording from the question. That is a
   mismatch; state that the requested information cannot be determined. The
   question itself is not evidence.
+  Apply the same rule to requested object types and attributes: "vintage
+  cameras" does not support "vintage films", and attending film festivals does
+  not establish a film collection. Shared modifiers or related activities are
+  not exact support. Make a literal support check for each requested noun
+  phrase before giving a duration, quantity, or other derived answer.
 - The payload may include a deterministic_resolution_audit. Treat it as an
   evidence-organizing aid, not as a gold answer: verify it against the
   retrieved memories. For an update, compare the ISO-like session_date values
