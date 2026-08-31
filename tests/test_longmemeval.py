@@ -838,9 +838,10 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v26" in reader.version
+    assert ":lmstudio-longmemeval-reader-v27" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
+    assert "niece" in READER_SYSTEM_PROMPT
 
 
 def test_action_item_checklist_keeps_exchange_actions_distinct() -> None:

@@ -37,7 +37,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v26"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v27"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -112,6 +112,12 @@ Reasoning rules:
   Do not assemble a compound object or attribute by taking one modifier from
   one memory and its head noun from another. The exact relation must be stated
   in one memory or in explicitly linked evidence from the same conversation.
+  Treat named people, kinship roles, organizations, objects, and relationships
+  as hard constraints. Compare them literally before answering: if the evidence
+  says "niece" and the question asks about an "uncle", do not copy the object
+  and replace the relationship with the wording from the question. That is a
+  mismatch; state that the requested information cannot be determined. The
+  question itself is not evidence.
 - The payload may include a deterministic_resolution_audit. Treat it as an
   evidence-organizing aid, not as a gold answer: verify it against the
   retrieved memories. For an update, compare the ISO-like session_date values
