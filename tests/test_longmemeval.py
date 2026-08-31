@@ -39,6 +39,7 @@ from snipara_memory.qa import (
     _action_item_checklist,
     _apply_update_resolution_guard,
     _deterministic_resolution_audit,
+    _parse_judge_label,
     _reader_context_limit,
 )
 
@@ -837,7 +838,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v25" in reader.version
+    assert ":lmstudio-longmemeval-reader-v26" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
 
@@ -1166,6 +1167,53 @@ async def test_reader_payload_preserves_turn_provenance_and_session_bundle() -> 
     assert captured["session_groups"][0]["user_evidence_ranks"] == [1]
     assert captured["deterministic_resolution_audit"]["kind"] == "multi_session"
     assert captured["deterministic_resolution_audit"]["distinct_session_count"] == 1
+
+
+def test_temporal_resolution_keeps_companion_qualifier() -> None:
+    context = [
+        {
+            "source_session_id": "session-dad",
+            "session_date": "2023/02/17",
+            "title": "User visited museum with dad",
+            "content": "The user visited the Natural History Museum with their dad.",
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+            "temporal_anchor": "2023/02/17",
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/03/25",
+        },
+        {
+            "source_session_id": "session-friend",
+            "session_date": "2022/10/22",
+            "title": "Behind-the-scenes tour with friend",
+            "content": "The user went to the Science Museum with a friend.",
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+            "temporal_anchor": "2022/10/22",
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/03/25",
+        },
+    ]
+
+    audit = _deterministic_resolution_audit(
+        "How many months ago did I visit a museum with a friend?",
+        context,
+    )
+
+    assert audit["temporal_candidates"][0]["source_session_id"] == "session-friend"
+
+
+def test_judge_label_parser_does_not_treat_yesterday_as_yes() -> None:
+    assert _parse_judge_label("Yes") is True
+    assert _parse_judge_label("No, the response is incomplete") is False
+    assert _parse_judge_label("The verdict: no") is False
+
+    try:
+        _parse_judge_label("The answer is yesterday")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("A non-label substring must not produce a judge label")
 
 
 async def test_qa_retrieval_keeps_distinct_sessions_for_multi_session_questions(

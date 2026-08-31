@@ -37,7 +37,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v25"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v26"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -94,6 +94,9 @@ Reasoning rules:
   explicit temporal_anchor when present, and calculate the requested interval
   or order. Treat session_date as the event date only when the evidence places
   the event in that session.
+  Preserve qualifiers such as who accompanied the user, the venue, and the
+  object; an event matching only "museum" is not a match for "museum with a
+  friend" when another evidence record satisfies the full relation.
 - For preference questions, use the user's stated preferences and constraints
   to answer or personalize the recommendation; do not substitute generic advice.
   Preserve explicit qualifiers such as recent, upcoming, local, budget, or
@@ -345,12 +348,23 @@ def _parse_resolution_date(value: object) -> date | None:
         return None
 
 
+def _resolution_session_date(memory: Mapping[str, Any]) -> date:
+    """Return the best stable date for ordering evidence observations."""
+
+    for key in ("observed_at", "session_date"):
+        parsed = _parse_resolution_date(memory.get(key))
+        if parsed is not None:
+            return parsed
+    return date.min
+
+
 def _resolution_record(memory: Mapping[str, Any]) -> dict[str, Any]:
     """Keep resolver output auditable without copying benchmark gold fields."""
 
     return {
         "source_session_id": str(memory.get("source_session_id") or "unknown"),
         "session_date": memory.get("session_date"),
+        "observed_at": memory.get("observed_at"),
         "title": memory.get("title"),
         "content": memory.get("content"),
         "evidence_kind": memory.get("evidence_kind"),
@@ -487,7 +501,7 @@ def _resolution_candidates(
     candidates.sort(
         key=lambda item: (
             item[0],
-            _parse_resolution_date(item[1].get("session_date")) or date.min,
+            _resolution_session_date(item[1]),
         ),
         reverse=True,
     )
@@ -566,6 +580,31 @@ _TEMPORAL_ACTION_GROUPS = (
     frozenset({"order", "ordered", "buy", "bought", "purchase", "purchas"}),
     frozenset({"participate", "participat", "attend", "attended", "visit", "visited"}),
 )
+
+_TEMPORAL_COMPANION_GROUPS = (
+    frozenset({"friend", "friends"}),
+    frozenset({"dad", "father"}),
+    frozenset({"mom", "mother"}),
+    frozenset({"sister"}),
+    frozenset({"brother"}),
+    frozenset({"coworker", "coworkers", "colleague", "colleagues"}),
+)
+
+
+def _temporal_candidate_matches_qualifiers(
+    phrase: str,
+    memory: Mapping[str, Any],
+) -> bool:
+    """Reject an event matching the object but not its stated relation."""
+
+    phrase_terms = _resolution_terms(phrase)
+    memory_terms = _resolution_terms(
+        " ".join(str(memory.get(key) or "") for key in ("title", "content"))
+    )
+    for group in _TEMPORAL_COMPANION_GROUPS:
+        if phrase_terms & group and not memory_terms & group:
+            return False
+    return True
 
 
 def _temporal_action_bonus(
@@ -658,7 +697,7 @@ def _deterministic_resolution_audit(
             if quantity is not None:
                 quantity_candidates.append(
                     (
-                        _parse_resolution_date(memory.get("session_date")) or date.min,
+                        _resolution_session_date(memory),
                         quantity,
                         memory,
                     )
@@ -732,6 +771,8 @@ def _deterministic_resolution_audit(
                     )
                 )
                 overlap = phrase_terms & memory_terms
+                if not _temporal_candidate_matches_qualifiers(phrase, memory):
+                    continue
                 # A temporal event must be supported by more than a generic
                 # word such as "friend" or "birthday". This avoids attaching
                 # a date from an unrelated conversation to the requested event.
@@ -824,7 +865,7 @@ def _deterministic_resolution_audit(
             user_evidence_only=True,
         )
         candidates.sort(
-            key=lambda item: _parse_resolution_date(item[1].get("session_date")) or date.min,
+            key=lambda item: _resolution_session_date(item[1]),
             reverse=True,
         )
         return {
@@ -1057,6 +1098,27 @@ def _message_content(response: Mapping[str, Any]) -> str:
     if not content:
         raise ValueError("LM Studio response content is empty")
     return content
+
+
+def _parse_judge_label(raw: str) -> bool:
+    """Parse the official yes/no judge output without substring false positives."""
+
+    normalized = raw.strip().lower()
+    first_token = re.match(r"^(yes|no)\b", normalized)
+    if first_token:
+        return first_token.group(1) == "yes"
+
+    labelled = re.search(
+        r"\b(?:answer|response|label|verdict)\s*[:=]?\s*(yes|no)\b",
+        normalized,
+    )
+    if labelled:
+        return labelled.group(1) == "yes"
+
+    labels = re.findall(r"\b(yes|no)\b", normalized)
+    if len(labels) == 1:
+        return labels[0] == "yes"
+    raise ValueError("LM Studio judge output did not contain one unambiguous yes/no label")
 
 
 @dataclass(slots=True)
@@ -1323,8 +1385,9 @@ class LmStudioLongMemEvalJudge:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
-        # Keep the upstream evaluator's semantics for comparability.
-        return "yes" in raw.lower(), raw
+        # Keep the upstream evaluator's semantics for comparability while
+        # rejecting substring matches such as "yesterday".
+        return _parse_judge_label(raw), raw
 
 
 @dataclass(slots=True)

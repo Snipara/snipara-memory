@@ -120,6 +120,72 @@ async def test_explicit_memory_key_supersession_is_core_lifecycle_behavior() -> 
     assert buried.superseded_by_id == newer.id
 
 
+async def test_explicit_supersession_uses_observed_time_when_import_arrives_late() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+
+    current = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The deployment target is the production cluster.",
+            memory_key="deployment.target",
+            provenance_key="handoff-2",
+            observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+        )
+    )
+    late_older = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The deployment target is the staging cluster.",
+            memory_key="deployment.target",
+            supersedes_memory_key="deployment.target",
+            provenance_key="handoff-1",
+            observed_at=datetime(2026, 8, 20, tzinfo=UTC),
+        )
+    )
+
+    active = await service.list_memories("demo", statuses=[MemoryStatus.ACTIVE])
+    assert [memory.id for memory in active] == [current.id]
+    buried = await service._store.get_memory(late_older.id)  # type: ignore[attr-defined]
+    assert buried is not None
+    assert buried.status is MemoryStatus.GRAVEYARD
+    assert buried.superseded_by_id == current.id
+
+
+async def test_contradiction_newer_resolution_uses_observed_time() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+
+    older_observation = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The user works from Paris.",
+            observed_at=datetime(2026, 8, 20, tzinfo=UTC),
+            confidence=0.8,
+        )
+    )
+    newer_observation = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The user works from Zurich.",
+            observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+            confidence=0.8,
+        )
+    )
+
+    contradiction = (
+        await service.detect_contradictions("demo", similarity_threshold=0.0)
+    )[0]
+    resolved = await service.resolve_contradiction(
+        ResolveContradictionRequest(
+            contradiction_id=contradiction.id,
+            resolution=ContradictionResolution.NEWER,
+            resolved_by="test",
+        )
+    )
+
+    assert resolved.winner_memory_id == newer_observation.id
+    assert resolved.loser_memory_id == older_observation.id
+
+
 async def test_recall_can_deduplicate_and_diversify_provenance() -> None:
     service = MemoryService(store=InMemoryMemoryStore())
     for index, (source, content) in enumerate(
@@ -154,6 +220,64 @@ async def test_recall_can_deduplicate_and_diversify_provenance() -> None:
     assert len(matches) == 3
     assert len({match.memory.provenance_key for match in matches}) == 2
     assert len({match.memory.content_hash for match in matches}) == 3
+
+
+async def test_recall_deduplicates_within_a_provenance_group_only() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+    for index, source in enumerate(("session-a", "session-a", "session-b")):
+        await service.store_memory(
+            StoreMemoryRequest(
+                namespace_id="demo",
+                content="The user selected the standard plan.",
+                provenance_key=source,
+                memory_id=f"same-fact-{index}",
+            )
+        )
+
+    matches = await service.semantic_recall(
+        RecallQuery(
+            namespace_id="demo",
+            query="selected standard plan",
+            limit=2,
+            candidate_limit=10,
+            diversify_by_provenance=True,
+            max_per_provenance=1,
+            deduplicate_evidence=True,
+        )
+    )
+
+    assert len(matches) == 2
+    assert {match.memory.provenance_key for match in matches} == {
+        "session-a",
+        "session-b",
+    }
+
+
+async def test_recall_prefers_latest_observation_when_relevance_ties() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+    older = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The deployment uses the stable endpoint.",
+            observed_at=datetime(2026, 8, 20, tzinfo=UTC),
+            memory_id="older-observation",
+        )
+    )
+    newer = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The deployment uses the stable endpoint.",
+            observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+            memory_id="newer-observation",
+        )
+    )
+
+    matches = await service.semantic_recall(
+        RecallQuery(namespace_id="demo", query="deployment stable endpoint", limit=1)
+    )
+
+    assert matches[0].memory.id == newer.id
+    assert matches[0].memory.id != older.id
 
 
 async def test_recall_can_include_sibling_provenance_context() -> None:

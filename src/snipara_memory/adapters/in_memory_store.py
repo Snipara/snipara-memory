@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from collections import Counter
+from datetime import UTC, datetime
 
 from ..domain import Contradiction, GraveyardEntry, Memory, MemoryStatus, MemoryTier, MemoryType, RecallMatch, RecallQuery
 
@@ -81,11 +82,28 @@ class InMemoryMemoryStore:
             key=lambda match: (
                 match.score,
                 match.memory.confidence,
-                match.memory.last_accessed_at or match.memory.created_at,
+                match.memory.relevance_boost,
+                self._observation_sort_key(match.memory),
+                match.memory.last_accessed_at
+                or datetime.min.replace(tzinfo=UTC),
             ),
             reverse=True,
         )
         return matches[: query.limit]
+
+    @staticmethod
+    def _observation_sort_key(memory: Memory) -> tuple[datetime, datetime, str]:
+        observed_at = memory.observed_at or memory.created_at
+        created_at = memory.created_at
+        if observed_at is None:
+            observed_at = datetime.min.replace(tzinfo=UTC)
+        if created_at is None:
+            created_at = datetime.min.replace(tzinfo=UTC)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return observed_at, created_at, memory.id
 
     async def list_memories(
         self,

@@ -70,8 +70,11 @@ def select_diverse_matches(
 
     The algorithm is intentionally domain-agnostic: it knows only about
     evidence identity and provenance, not about benchmark categories or query
-    wording.  Ranked matches are visited round-robin by provenance group, so a
-    single verbose source cannot consume the whole context budget.
+    wording. Ranked matches are visited round-robin by provenance group, so a
+    single verbose source cannot consume the whole context budget. When
+    deduplication is enabled, identical evidence is collapsed within one
+    provenance group while identical text from distinct source groups remains
+    available for corroboration and multi-source questions.
     """
 
     if limit <= 0:
@@ -80,14 +83,15 @@ def select_diverse_matches(
         raise ValueError("max_per_provenance must be positive when provided")
 
     grouped: dict[str, list[RecallMatch]] = {}
-    seen_hashes: set[str] = set()
+    seen_hashes_by_provenance: dict[str, set[str]] = defaultdict(set)
     for match in matches:
+        provenance = provenance_key_for_memory(match.memory)
         if deduplicate_evidence:
             content_hash = match.memory.content_hash
-            if content_hash in seen_hashes:
+            if content_hash in seen_hashes_by_provenance[provenance]:
                 continue
-            seen_hashes.add(content_hash)
-        grouped.setdefault(provenance_key_for_memory(match.memory), []).append(match)
+            seen_hashes_by_provenance[provenance].add(content_hash)
+        grouped.setdefault(provenance, []).append(match)
 
     if not grouped:
         return []
@@ -97,11 +101,12 @@ def select_diverse_matches(
         if not deduplicate_evidence:
             return list(matches)[:limit]
         selected: list[RecallMatch] = []
-        seen_hashes: set[str] = set()
+        seen_hashes_by_provenance: dict[str, set[str]] = defaultdict(set)
         for match in matches:
-            if match.memory.content_hash in seen_hashes:
+            provenance = provenance_key_for_memory(match.memory)
+            if match.memory.content_hash in seen_hashes_by_provenance[provenance]:
                 continue
-            seen_hashes.add(match.memory.content_hash)
+            seen_hashes_by_provenance[provenance].add(match.memory.content_hash)
             selected.append(match)
             if len(selected) >= limit:
                 break
@@ -356,7 +361,10 @@ class MemoryService:
             key=lambda match: (
                 match.score,
                 match.memory.confidence,
-                match.memory.last_accessed_at or match.memory.created_at,
+                match.memory.relevance_boost,
+                self._observation_sort_key(match.memory),
+                match.memory.last_accessed_at
+                or datetime.min.replace(tzinfo=UTC),
             ),
             reverse=True,
         )
@@ -769,20 +777,60 @@ class MemoryService:
                 if supersedes_key:
                     previous = current_by_key.get(supersedes_key)
                     if previous is not None and previous.id != memory.id:
-                        await self.move_to_graveyard(
-                            previous.id,
-                            reason=GraveyardReason.SUPERSEDED,
-                            replaced_by_id=memory.id,
-                            restore_hint=(
-                                "Restore the graveyard entry if the newer observation "
-                                "is later determined to be incorrect."
-                            ),
-                        )
-                        superseded_ids.append(previous.id)
-                    current_by_key[supersedes_key] = memory
+                        if self._observation_sort_key(memory) >= self._observation_sort_key(
+                            previous
+                        ):
+                            await self.move_to_graveyard(
+                                previous.id,
+                                reason=GraveyardReason.SUPERSEDED,
+                                replaced_by_id=memory.id,
+                                restore_hint=(
+                                    "Restore the graveyard entry if the newer observation "
+                                    "is later determined to be incorrect."
+                                ),
+                            )
+                            superseded_ids.append(previous.id)
+                            current_by_key[supersedes_key] = memory
+                        else:
+                            # Imports can arrive out of order. Keep the latest
+                            # observed value active and bury the late, older
+                            # replacement instead of letting arrival order
+                            # rewrite the current identity.
+                            await self.move_to_graveyard(
+                                memory.id,
+                                reason=GraveyardReason.SUPERSEDED,
+                                replaced_by_id=previous.id,
+                                restore_hint=(
+                                    "This observation arrived late and is older than the "
+                                    "active value; restore it only if its timestamp is corrected."
+                                ),
+                            )
+                            superseded_ids.append(memory.id)
+                    else:
+                        current_by_key[supersedes_key] = memory
                 if memory.memory_key:
-                    current_by_key[memory.memory_key] = memory
+                    current = current_by_key.get(memory.memory_key)
+                    if current is None or self._observation_sort_key(memory) >= self._observation_sort_key(
+                        current
+                    ):
+                        current_by_key[memory.memory_key] = memory
         return tuple(superseded_ids)
+
+    @staticmethod
+    def _observation_sort_key(memory: Memory) -> tuple[datetime, datetime, str]:
+        """Order observations by domain time, then creation time, then id."""
+
+        observed_at = memory.observed_at or memory.created_at
+        created_at = memory.created_at
+        if observed_at is None:
+            observed_at = datetime.min.replace(tzinfo=UTC)
+        if created_at is None:
+            created_at = datetime.min.replace(tzinfo=UTC)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return observed_at, created_at, memory.id
 
     def _build_memory(self, request: StoreMemoryRequest) -> Memory:
         now = datetime.now(UTC)
@@ -861,7 +909,7 @@ class MemoryService:
         if request.resolution is ContradictionResolution.NEWER:
             ordered = sorted(
                 [memory_a, memory_b],
-                key=lambda memory: memory.created_at,
+                key=self._observation_sort_key,
                 reverse=True,
             )
             return ordered[0], ordered[1]
@@ -869,7 +917,10 @@ class MemoryService:
         if request.resolution is ContradictionResolution.HIGHER_CONFIDENCE:
             ordered = sorted(
                 [memory_a, memory_b],
-                key=lambda memory: (memory.confidence, memory.created_at),
+                key=lambda memory: (
+                    memory.confidence,
+                    *self._observation_sort_key(memory),
+                ),
                 reverse=True,
             )
             return ordered[0], ordered[1]
