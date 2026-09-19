@@ -1,6 +1,6 @@
 [project]
 name = "snipara-memory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Project-scoped memory primitives for AI-assisted projects"
 readme = "README.md"
 requires-python = ">=3.11"

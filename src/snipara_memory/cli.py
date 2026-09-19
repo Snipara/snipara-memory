@@ -26,8 +26,8 @@ from .benchmark import (
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
 from .longmemeval import (
-    HeuristicFactExtractor,
     LM_STUDIO_DEFAULT_PROMPT_VERSION,
+    HeuristicFactExtractor,
     LmStudioBatchFactExtractor,
     LmStudioFactExtractor,
 )
@@ -35,10 +35,10 @@ from .mcp_server import run_stdio_server
 from .qa import (
     LmStudioLongMemEvalJudge,
     LmStudioLongMemEvalReader,
+    OpenRouterJevLongMemEvalJudge,
     stratified_longmemeval_question_ids,
     write_longmemeval_hypotheses,
 )
-
 
 COMMANDS = {
     "serve",
@@ -223,7 +223,29 @@ def build_parser() -> argparse.ArgumentParser:
     longmemeval_qa.add_argument(
         "--judge-model",
         default=os.getenv("LM_STUDIO_JUDGE_MODEL"),
-        help="Judge model (or LM_STUDIO_JUDGE_MODEL)",
+        help="Judge model (or LM_STUDIO_JUDGE_MODEL; defaults to Jev for --judge-provider openrouter-jev)",
+    )
+    longmemeval_qa.add_argument(
+        "--judge-provider",
+        choices=("lm-studio", "openrouter-jev"),
+        default=os.getenv("LONGMEMEVAL_JUDGE_PROVIDER", "lm-studio"),
+        help="Judge backend for LongMemEval correctness decisions",
+    )
+    longmemeval_qa.add_argument(
+        "--openrouter-api-key",
+        default=os.getenv("OPENROUTER_API_KEY"),
+        help="OpenRouter API key for --judge-provider openrouter-jev",
+    )
+    longmemeval_qa.add_argument(
+        "--openrouter-base-url",
+        default=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/alpha"),
+        help="OpenRouter alpha decisions base URL",
+    )
+    longmemeval_qa.add_argument(
+        "--jev-threshold",
+        type=float,
+        default=float(os.getenv("LONGMEMEVAL_JEV_THRESHOLD", "0.8")),
+        help="Noul score threshold for Jev correctness decisions",
     )
     longmemeval_qa.add_argument(
         "--base-url",
@@ -423,7 +445,10 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
     common_model = args.model
     extractor_model = args.extractor_model or common_model
     reader_model = args.reader_model or common_model
-    judge_model = args.judge_model or common_model
+    judge_model = (
+        args.judge_model
+        or ("typesafe/jev-1.13" if args.judge_provider == "openrouter-jev" else common_model)
+    )
     if args.extractor == "lm-studio" and not extractor_model:
         raise SystemExit(
             "LongMemEval QA extraction requires --extractor-model, --model, "
@@ -434,10 +459,15 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
             "LongMemEval QA reader requires --reader-model, --model, "
             "or LM_STUDIO_READER_MODEL."
         )
-    if not judge_model:
+    if args.judge_provider == "lm-studio" and not judge_model:
         raise SystemExit(
             "LongMemEval QA judge requires --judge-model, --model, "
             "or LM_STUDIO_JUDGE_MODEL."
+        )
+    if args.judge_provider == "openrouter-jev" and not args.openrouter_api_key:
+        raise SystemExit(
+            "LongMemEval QA Jev judge requires --openrouter-api-key "
+            "or OPENROUTER_API_KEY."
         )
 
     extractor = (
@@ -473,15 +503,25 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout,
         retries=args.retries,
     )
-    judge = LmStudioLongMemEvalJudge(
-        model=judge_model,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        reasoning_effort=None,
-        max_tokens=args.judge_max_tokens,
-        timeout_seconds=args.timeout,
-        retries=args.retries,
-    )
+    if args.judge_provider == "openrouter-jev":
+        judge = OpenRouterJevLongMemEvalJudge(
+            model=judge_model,
+            api_key=args.openrouter_api_key,
+            base_url=args.openrouter_base_url,
+            threshold=args.jev_threshold,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+        )
+    else:
+        judge = LmStudioLongMemEvalJudge(
+            model=judge_model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            reasoning_effort=None,
+            max_tokens=args.judge_max_tokens,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+        )
     if args.stratified_per_category is not None:
         if args.stratified_per_category <= 0:
             raise SystemExit("--stratified-per-category must be positive.")

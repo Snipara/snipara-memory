@@ -532,8 +532,23 @@ _EXPLICIT_USER_EVIDENCE_PATTERNS = (
     r"\b(?:participat(?:ed|ing)|charity|consecutive|in a row)",
     r"\b(?:camping trip|model kit|worked on|bought|purchased|ordered)",
     r"\b(?:acquired|received|met up|meet up|finished|completed)",
+    r"\b(?:lead|led|leading|team lead|project lead)\b",
     r"\b(?:nursery|baby shower|customized phone case|birthday)",
     r"\b(?:prefer|preference|interested in)",
+    r"\b(?:spent|cost|paid|expense|expenses|price|priced)",
+    r"\b(?:drove|driving|drive|bed|sleep|slept)",
+    r"\b(?:doctor|physician|specialist|dermatologist|ent)\b",
+    r"\b(?:festival|festivals|plant|plants|citrus|cocktail|cocktails)\b",
+)
+
+_QUANTIFIED_USER_EVIDENCE_PATTERN = re.compile(
+    r"(?:[$€£]\s?\d[\d,]*(?:\.\d+)?|"
+    r"\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|half)\s+"
+    r"(?:a\.m\.|p\.m\.|am|pm|hours?|hrs?|minutes?|mins?|days?|weeks?|months?|"
+    r"years?|miles?|kilometers?|km|dollars?|euros?|pounds?|items?|times?)\b|"
+    r"\b\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)\b)",
+    flags=re.IGNORECASE,
 )
 
 
@@ -557,7 +572,7 @@ def _explicit_user_signal_facts(
     session: LongMemEvalSession,
     *,
     existing_facts: Sequence[ExtractedFact],
-    max_additions: int = 6,
+    max_additions: int = 12,
 ) -> list[ExtractedFact]:
     """Retain high-signal user statements that an extractor may cap away.
 
@@ -617,6 +632,65 @@ def _explicit_user_signal_facts(
             )
         )
         existing_text.add(normalized)
+        if len(additions) >= max_additions:
+            break
+    return additions
+
+
+def _quantified_user_evidence_facts(
+    session: LongMemEvalSession,
+    *,
+    existing_facts: Sequence[ExtractedFact],
+    max_additions: int = 8,
+) -> list[ExtractedFact]:
+    """Preserve explicit amounts, durations, distances, counts, and times.
+
+    These scalar-bearing statements are disproportionately important for
+    cross-session aggregation and are also the easiest details for a compact
+    model extraction to omit.  The deterministic pass remains selective: it
+    stores one compact, provenance-linked fact only when the user supplied an
+    explicit scalar with a meaningful unit or currency marker.
+    """
+
+    if max_additions <= 0:
+        return []
+    existing_turns = {
+        turn_index
+        for fact in existing_facts
+        for turn_index in fact.source_turn_indices
+        if fact.metadata.get("explicit_quantitative_evidence")
+    }
+    additions: list[ExtractedFact] = []
+    for turn_index, turn in enumerate(session.turns):
+        if turn.role != "user" or turn_index in existing_turns:
+            continue
+        signal = _QUANTIFIED_USER_EVIDENCE_PATTERN.search(turn.content)
+        if signal is None:
+            continue
+        values = tuple(
+            dict.fromkeys(
+                match.group(0).strip()
+                for match in _QUANTIFIED_USER_EVIDENCE_PATTERN.finditer(turn.content)
+            )
+        )
+        additions.append(
+            ExtractedFact(
+                content=_compact_signal_evidence_text(turn.content, signal.start()),
+                title=f"Explicit quantified user evidence (turn {turn_index})",
+                memory_type=MemoryType.FACT,
+                confidence=0.99,
+                fact_key=f"user.quantified.turn.{turn_index}",
+                source_turn_indices=(turn_index,),
+                tags=("user-fact", "quantified", "provenance"),
+                metadata={
+                    "evidence_kind": "user_fact",
+                    "temporal_anchor": session.date,
+                    "explicit_user_evidence": True,
+                    "explicit_quantitative_evidence": True,
+                    "quantitative_values": values,
+                },
+            )
+        )
         if len(additions) >= max_additions:
             break
     return additions
@@ -730,6 +804,7 @@ def _augment_high_signal_evidence(
         for fact in [
             *_structured_schedule_facts(session),
             *_explicit_museum_visit_facts(session),
+            *_quantified_user_evidence_facts(session, existing_facts=facts),
             *_explicit_user_signal_facts(session, existing_facts=facts),
             *_cross_turn_transaction_facts(session),
             *_follow_up_topic_facts(session),

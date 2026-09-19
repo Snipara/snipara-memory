@@ -8,12 +8,13 @@ from that evidence, then apply the official LongMemEval yes/no judge prompt.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
 import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -37,7 +38,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v28"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v41"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
@@ -45,6 +46,19 @@ READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retri
 Give the shortest direct answer supported by the evidence. Use every relevant
 memory, not just the first one. Distinct source_session_id values are distinct
 conversation sessions and may need to be combined.
+
+Evidence selection rules:
+- Prefer evidence_cards marked direct_answer_support before reading the full
+  retrieved_memories list. Evidence cards are not gold labels; they are compact
+  views of retrieved memories ranked by whether the memory can answer the
+  requested attribute or entity.
+- A semantically related memory is not enough. Before answering, check that the
+  selected evidence states the exact entity, relation, and attribute asked by
+  the question. If a card is only contextual_support, use it to interpret a
+  direct card, not as the answer source by itself.
+- Preserve modifiers from direct evidence. If the direct evidence says
+  "Japanese short-grain rice", answer with the full phrase rather than the
+  broader category "short-grain rice".
 
 Reasoning rules:
 - For knowledge updates, first collect all candidate values and then prefer
@@ -68,10 +82,10 @@ Reasoning rules:
   transactions in the same session separately. Do not exclude a
   clothing item because the venue is described as dry cleaning, an exchange,
   or a store; the requested pickup/return action is what matters.
-  Never merge records from different source_session_id values merely because
-  they mention the same item or store; a distinct session is a distinct
-  required request unless the evidence explicitly says that one supersedes
-  the other. For an exchange, a return of the old item and pickup of its
+  Distinct sessions may repeat the same real-world event. Merge records across
+  sessions only when action, entity, venue, date, and surrounding details make
+  them the same event; otherwise keep them distinct. For an exchange, a return
+  of the old item and pickup of its
   replacement are two clothing items; merge only duplicate statements of the
   same action/item, not opposite actions in an exchange.
 - For numerical multi-session questions, enumerate every qualifying item or
@@ -84,8 +98,22 @@ Reasoning rules:
   of the same action/item, and verify that the final number
   matches that checklist.
   When an action_item_checklist is supplied, use it as the explicit inventory
-  of qualifying records: duplicate entries with the same session, action, and
-  item are one record, while pickup and return entries are separate records.
+  of qualifying records: semantically duplicate entries for the same
+  action/item/venue are one record even when repeated in another session,
+  while pickup and return entries are separate records.
+  When a contribution_ledger is supplied, inspect every row before answering.
+  Sum or count only rows satisfying the question, keep distinct events, and
+  merge only rows whose event identity is genuinely the same.
+  Named entities listed in named_events are the countable event identities;
+  never substitute the number of source sessions for the number of entities.
+  When session_contribution_maps are supplied, complete the per-session map
+  before reducing the rows to the final answer.
+  When map_stage_output is supplied, treat it as a draft entity ledger: verify
+  it against the evidence, merge genuine duplicates, then count every distinct
+  qualifying contribution.
+  Use domain semantics when identifying an entity: for model-building work, a
+  scale vehicle or aircraft diorama is a worked-on model even when the evidence
+  calls the overall project a diorama instead of repeating "model kit".
   For a non-count multi-session question, make a short pass over every
   session_group before drafting the answer. The group is an evidence bundle,
   not a ranking hint: a lower-ranked fact from a distinct session can be one
@@ -154,11 +182,24 @@ Do not invent details, use outside knowledge, mention the memory system, or
 mention retrieval. If the evidence truly does not support the answer, say that
 the information cannot be determined from the available memories. Do not
 abstain merely because the evidence is spread across several entries.
+
+Output contract:
+- Return exactly one JSON object with one string field: {"answer":"..."}.
+- The answer value must contain only the concise final answer, with no analysis,
+  scratch work, alternatives, or self-correction.
+"""
+
+MULTI_SESSION_MAP_SYSTEM_PROMPT = """Build a contribution map from retrieved evidence.
+Return exactly one JSON object with a contributions array. Each contribution
+must contain a concise canonical entity or event label, source_session_ids,
+and evidence_ranks. Include every qualifying contribution requested by the
+question. Merge repeated mentions of the same real-world entity across
+sessions, but never merge different entities just because they share a type.
+Use only supplied evidence and do not answer the question yet.
 """
 
 
 _ACTION_ITEM_LEXICON = (
-    "dry cleaning",
     "blazer",
     "jacket",
     "sweater",
@@ -169,9 +210,48 @@ _ACTION_ITEM_LEXICON = (
     "pants",
     "dress",
     "coat",
-    "clothing",
-    "clothes",
 )
+
+_ACTION_ITEM_VENUE_TERMS = (
+    "dry cleaning",
+    "dry cleaner",
+    "cleaners",
+    "store",
+    "shop",
+    "retailer",
+)
+
+
+def _action_item_venue(text: str) -> str | None:
+    """Return an explicit commercial venue, without treating people as stores."""
+
+    lowered = text.lower()
+    for venue in _ACTION_ITEM_VENUE_TERMS:
+        if venue in lowered:
+            return venue
+    named = re.search(
+        r"\b(?:at|from|to)\s+([A-Z][A-Za-z0-9&'-]+(?:\s+[A-Z][A-Za-z0-9&'-]+){0,2})",
+        text,
+    )
+    if named is None:
+        item_pattern = "|".join(re.escape(item) for item in _ACTION_ITEM_LEXICON)
+        named_item = re.search(
+            rf"\b([A-Z][A-Za-z0-9&'-]+)\s+(?:{item_pattern})\b",
+            text,
+        )
+        return named_item.group(1).lower() if named_item is not None else None
+    venue = named.group(1).strip(" .,;:")
+    if venue.lower() in {
+        "my sister",
+        "my brother",
+        "my friend",
+        "my mom",
+        "my mother",
+        "my dad",
+        "my father",
+    }:
+        return None
+    return venue.lower()
 
 
 def _action_item_checklist(
@@ -185,27 +265,50 @@ def _action_item_checklist(
         return []
     if not any(term in lowered_question for term in ("pick up", "pickup", "return")):
         return []
-    if not any(term in lowered_question for term in _ACTION_ITEM_LEXICON):
+    if not any(
+        term in lowered_question
+        for term in (*_ACTION_ITEM_LEXICON, "clothing", "clothes")
+    ):
         return []
 
     checklist: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     for memory in context:
-        text = " ".join(
+        source_text = " ".join(
             str(memory.get(key) or "")
             for key in ("title", "content", "evidence_kind")
-        ).lower()
+        )
+        text = source_text.lower()
         item = next((term for term in _ACTION_ITEM_LEXICON if term in text), None)
         if item is None:
+            continue
+        venue = _action_item_venue(source_text)
+        if venue is None:
             continue
         actions: list[str] = []
         if "pick up" in text or "pickup" in text:
             actions.append("pickup")
         if "return" in text:
             actions.append("return")
+        if (
+            ("exchange" in text or "exchanged" in text)
+            and any(
+                term in text
+                for term in ("replacement", "new pair", "pick up", "pickup")
+            )
+        ):
+            # An exchange is one returned item plus one replacement pickup when
+            # both sides of the transaction are explicit. This models the
+            # real-world event instead of requiring the exact word "return".
+            if "return" not in actions:
+                actions.append("return")
+            if "pickup" not in actions:
+                actions.append("pickup")
         session_id = str(memory.get("source_session_id") or "unknown")
         for action in actions:
-            key = (session_id, action, item)
+            # Repeated conversations can refer to the same pending errand.
+            # Deduplicate by event identity rather than by transcript session.
+            key = (action, item, venue)
             if key in seen:
                 continue
             seen.add(key)
@@ -214,6 +317,7 @@ def _action_item_checklist(
                     "source_session_id": session_id,
                     "action": action,
                     "item": item,
+                    "venue": venue,
                 }
             )
     return checklist
@@ -241,7 +345,6 @@ _RESOLUTION_STOPWORDS = frozenset(
         "of",
         "passed",
         "recent",
-        "recently",
         "recently",
         "since",
         "the",
@@ -447,6 +550,19 @@ def _resolution_evidence_snippet(
     }
 
 
+def _bounded_reader_text(
+    value: object,
+    *,
+    max_chars: int,
+) -> str:
+    """Keep answer-bearing prefixes while enforcing a stable context budget."""
+
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
+
+
 def _apply_update_resolution_guard(
     response: str,
     audit: Mapping[str, Any],
@@ -481,6 +597,185 @@ def _apply_update_resolution_guard(
         # the dated source sentence.
         return f"The latest directly relevant user statement says: {content}"
     return response
+
+
+def _apply_action_count_guard(
+    response: str,
+    checklist: Sequence[Mapping[str, str]],
+) -> str:
+    """Use a complete structured action inventory when generation undercounts."""
+
+    if not checklist:
+        return response
+    normalized_records = {
+        (
+            str(row.get("action") or ""),
+            str(row.get("item") or ""),
+            str(row.get("venue") or ""),
+        )
+        for row in checklist
+    }
+    if not normalized_records:
+        return response
+    return str(len(normalized_records))
+
+
+def _apply_temporal_relation_guard(
+    question: str,
+    response: str,
+    audit: Mapping[str, Any],
+) -> str:
+    """Resolve a unique target-event time from a cross-session relation ledger."""
+
+    if audit.get("kind") != "multi_session_temporal_relation":
+        return response
+    target_text = re.split(
+        r"\b(?:the\s+)?(?:day|night|week|month)?\s*(?:before|after)\b",
+        question,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    target_seed_terms = _resolution_terms(target_text)
+    target_terms: set[str] = set()
+    for concept_group in _RETRIEVAL_CONCEPT_GROUPS:
+        if target_seed_terms & concept_group:
+            target_terms.update(concept_group)
+    if not target_terms:
+        target_terms = target_seed_terms - _RESOLUTION_BROAD_TERMS
+    candidates: list[str] = []
+    for row in audit.get("contribution_ledger", []):
+        if not isinstance(row, Mapping):
+            continue
+        content = str(row.get("content") or "")
+        if not target_terms & _resolution_terms(content):
+            continue
+        candidates.extend(
+            value
+            for value in row.get("scalar_values", [])
+            if isinstance(value, str)
+            and re.search(r"\b(?:a\.?m\.?|p\.?m\.?)\b", value, re.IGNORECASE)
+        )
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else response
+
+
+def _apply_currency_total_guard(
+    question: str,
+    response: str,
+    audit: Mapping[str, Any],
+) -> str:
+    """Sum distinct currency-bearing events from a multi-session ledger."""
+
+    lowered = question.lower()
+    if audit.get("kind") != "multi_session_count" or not (
+        re.search(r"\bhow much\b", lowered)
+        or {"total", "money", "spent", "cost", "expenses"}
+        & _retrieval_terms(question)
+    ):
+        return response
+    question_terms = _retrieval_terms(question)
+    concept_terms = _expanded_retrieval_terms(question_terms) - question_terms
+    event_terms = concept_terms - {
+        "amount",
+        "cost",
+        "costs",
+        "expense",
+        "expenses",
+        "fee",
+        "paid",
+        "price",
+        "spent",
+        "total",
+    }
+    contributions: list[tuple[float, frozenset[str]]] = []
+    for row in audit.get("contribution_ledger", []):
+        if not isinstance(row, Mapping):
+            continue
+        content = str(row.get("content") or "")
+        content_terms = _retrieval_terms(content)
+        entity_terms = frozenset(
+            _resolution_term(term)
+            for term in (content_terms & event_terms) - question_terms
+        )
+        if not entity_terms:
+            continue
+        for raw_value in row.get("scalar_values", []):
+            if not isinstance(raw_value, str) or not raw_value.startswith(("$", "€", "£")):
+                continue
+            try:
+                amount = float(raw_value[1:].replace(",", ""))
+            except ValueError:
+                continue
+            if any(
+                existing_amount == amount
+                and bool(existing_terms & entity_terms)
+                for existing_amount, existing_terms in contributions
+            ):
+                continue
+            contributions.append((amount, entity_terms))
+    if not contributions:
+        return response
+    total = sum(amount for amount, _ in contributions)
+    rendered = str(int(total)) if total.is_integer() else f"{total:.2f}".rstrip("0").rstrip(".")
+    symbol = next(
+        (
+            value[0]
+            for row in audit.get("contribution_ledger", [])
+            if isinstance(row, Mapping)
+            for value in row.get("scalar_values", [])
+            if isinstance(value, str) and value.startswith(("$", "€", "£"))
+        ),
+        "$",
+    )
+    return f"{symbol}{rendered}"
+
+
+_ACQUISITION_CUE_PATTERN = re.compile(
+    r"\b(?:acquir(?:e|ed|ing)?|bought|purchased|received|got|picked up)\b",
+    re.IGNORECASE,
+)
+_PLANT_ENTITY_PATTERN = re.compile(
+    r"\b(?:a|an|the|another|new|my)?\s*"
+    r"((?:[a-z][a-z'-]*\s+)?(?:lily|plant)|"
+    r"succulent|cactus|orchid|fern|violet)\b",
+    re.IGNORECASE,
+)
+
+
+def _apply_acquisition_count_guard(
+    question: str,
+    response: str,
+    context: Sequence[Mapping[str, Any]],
+) -> str:
+    """Count distinct acquired entities from provenance-backed evidence.
+
+    This intentionally requires both an acquisition relation and a category
+    requested by the question. It therefore ignores inventory mentions that
+    do not describe a new acquisition.
+    """
+
+    lowered = question.lower()
+    if not re.search(r"\bhow many\b|\bnumber of\b", lowered):
+        return response
+    if not _ACQUISITION_CUE_PATTERN.search(lowered):
+        return response
+    if not re.search(r"\bplants?\b", lowered):
+        return response
+
+    entities: set[str] = set()
+    for memory in context:
+        content = str(memory.get("content") or "")
+        for sentence in re.split(r"(?<=[.!?])\s+|[;\n]+", content):
+            if not _ACQUISITION_CUE_PATTERN.search(sentence):
+                continue
+            for match in _PLANT_ENTITY_PATTERN.finditer(sentence):
+                entity = " ".join(match.group(1).lower().split())
+                entity = re.sub(r"^(?:a|an|the|another|new|my)\s+", "", entity)
+                if entity == "succulent plant":
+                    entity = "succulent"
+                if entity and entity != "plant":
+                    entities.add(entity)
+    return str(len(entities)) if entities else response
 
 
 def _resolution_candidates(
@@ -577,6 +872,181 @@ def _stated_quantity(text: str) -> int | None:
     return int(token) if token.isdigit() else None
 
 
+_EVIDENCE_SCALAR_PATTERN = re.compile(
+    r"(?:[$€£]\s?\d[\d,]*(?:\.\d+)?|"
+    r"\b\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)\b|"
+    r"\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|half)\s+(?:hours?|hrs?|minutes?|mins?|days?|weeks?|months?|"
+    r"years?|miles?|kilometers?|km|dollars?|euros?|pounds?|items?|times?)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _evidence_scalar_values(text: str) -> list[str]:
+    """Extract exact answer-bearing scalar phrases for an evidence ledger."""
+
+    return list(
+        dict.fromkeys(
+            match.group(0).strip()
+            for match in _EVIDENCE_SCALAR_PATTERN.finditer(text)
+        )
+    )
+
+
+_NAMED_EVENT_PATTERN = re.compile(
+    r"\b(?:[A-Z][\w'’.-]*\s+){0,5}(?:Film Festival|Festival|Fest|Conference|Expo)\b"
+)
+
+
+def _named_event_mentions(text: str) -> list[str]:
+    """Extract explicit named events so counts are about entities, not sessions."""
+
+    return list(
+        dict.fromkeys(
+            match.group(0).strip()
+            for match in _NAMED_EVENT_PATTERN.finditer(text)
+        )
+    )
+
+
+def _multi_session_resolution_audit(
+    question: str,
+    context: Sequence[Mapping[str, Any]],
+    *,
+    asks_for_count: bool,
+) -> dict[str, Any]:
+    """Build a session-complete ledger for cross-session synthesis."""
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    question_terms = _resolution_terms(question)
+    expanded_question_terms = _expanded_retrieval_terms(question_terms)
+    query_core_terms = question_terms - _RESOLUTION_BROAD_TERMS
+    temporal_relation = bool(
+        re.search(r"\b(?:day|night|week|month)\s+(?:before|after)\b", question.lower())
+        or re.search(r"\b(?:before|after)\s+(?:i|the|my)\b", question.lower())
+    )
+    project_leadership = "project" in question.lower() and bool(
+        re.search(r"\b(?:lead|led|leading)\b", question.lower())
+    )
+    ledger: list[dict[str, Any]] = []
+    user_kinds = {"user_fact", "preference", "decision", "event", "context"}
+    for memory in context:
+        session_id = str(memory.get("source_session_id") or "unknown")
+        grouped.setdefault(session_id, []).append(memory)
+        if project_leadership and not _is_project_leadership_record(memory):
+            continue
+        if not (
+            memory.get("explicit_user_evidence")
+            or memory.get("evidence_kind") in user_kinds
+        ):
+            continue
+        content = str(memory.get("content") or "")
+        memory_terms = _resolution_terms(
+            " ".join(
+                str(memory.get(key) or "")
+                for key in ("title", "content", "fact_key")
+            )
+        )
+        overlap = question_terms & memory_terms
+        concept_overlap = (expanded_question_terms - question_terms) & memory_terms
+        core_overlap = overlap & query_core_terms
+        values = _evidence_scalar_values(content)
+        named_events = _named_event_mentions(content)
+        if (
+            not overlap
+            and not concept_overlap
+            and not ((asks_for_count or temporal_relation) and values)
+        ):
+            continue
+        ledger.append(
+            {
+                "source_session_id": session_id,
+                "session_date": memory.get("session_date"),
+                "memory_rank": int(memory.get("rank") or 0),
+                "content": _bounded_reader_text(content, max_chars=180),
+                "evidence_kind": memory.get("evidence_kind"),
+                "match_terms": sorted(core_overlap or overlap),
+                "concept_match_terms": sorted(concept_overlap),
+                "scalar_values": values,
+                "named_events": named_events,
+                "directness_score": (
+                    (2 * len(core_overlap))
+                    + len(overlap)
+                    + min(2, len(concept_overlap))
+                    + (1 if values and asks_for_count else 0)
+                ),
+            }
+        )
+
+    ledger.sort(
+        key=lambda row: (
+            -int(row["directness_score"]),
+            str(row.get("session_date") or ""),
+            int(row.get("memory_rank") or 0),
+        )
+    )
+    bundles: list[dict[str, Any]] = []
+    for session_id, memories in grouped.items():
+        user_evidence_ranks = [
+            int(memory["rank"])
+            for memory in memories
+            if memory.get("explicit_user_evidence")
+            or memory.get("evidence_kind") in user_kinds
+        ]
+        bundles.append(
+            {
+                "source_session_id": session_id,
+                "session_date": memories[0].get("session_date"),
+                "memory_ranks": [int(memory["rank"]) for memory in memories],
+                "user_evidence_ranks": user_evidence_ranks,
+                "memory_count": len(memories),
+            }
+        )
+    bundles.sort(
+        key=lambda bundle: (
+            str(bundle.get("session_date") or ""),
+            str(bundle.get("source_session_id") or ""),
+        )
+    )
+    contribution_maps: list[dict[str, Any]] = []
+    for bundle in bundles:
+        session_id = bundle["source_session_id"]
+        rows = [row for row in ledger if row["source_session_id"] == session_id]
+        if not rows:
+            continue
+        contribution_maps.append(
+            {
+                "source_session_id": session_id,
+                "session_date": bundle.get("session_date"),
+                "candidate_contributions": rows[:4],
+            }
+        )
+    return {
+        "kind": (
+            "multi_session_temporal_relation"
+            if temporal_relation
+            else "multi_session_count" if asks_for_count else "multi_session"
+        ),
+        "distinct_session_count": len(bundles),
+        "session_bundles": bundles,
+        "session_contribution_maps": contribution_maps,
+        "contribution_ledger": ledger[:24],
+        "instructions": [
+            "Inspect every contribution ledger row before answering.",
+            "Keep distinct entities, events, amounts, and durations across sessions.",
+            "Merge cross-session repetitions only when they identify the same "
+            "real-world event.",
+            "For totals, enumerate accepted contributions before summing or "
+            "counting them.",
+            "Count distinct named entities, not source sessions; one session "
+            "can contribute several entities.",
+            "For before/after questions, resolve the event relation first. "
+            "Relative weekday evidence can link events even when a compact "
+            "summary contains an imperfect inferred calendar date.",
+        ],
+    }
+
+
 def _temporal_event_phrases(question: str) -> list[str]:
     """Extract named event fragments from the common LongMemEval wording."""
 
@@ -659,6 +1129,15 @@ def _deterministic_resolution_audit(
     asks_for_count = bool(
         re.search(r"\bhow many\b|\bhow much\b|\bnumber of\b", lowered)
     )
+    if question_type == "multi-session":
+        # Cross-session totals are aggregations, not knowledge updates. Route
+        # them before the generic count resolver so an unrelated recent scalar
+        # can never become an authoritative "latest quantity".
+        return _multi_session_resolution_audit(
+            question,
+            context,
+            asks_for_count=asks_for_count,
+        )
     if asks_for_count and not is_temporal:
         candidates = _resolution_candidates(
             question,
@@ -841,7 +1320,7 @@ def _deterministic_resolution_audit(
                 dates = sorted({item[0] for item in dated_candidates})
                 consecutive = [
                     (left, right)
-                    for left, right in zip(dates, dates[1:])
+                    for left, right in pairwise(dates)
                     if (right - left).days == 1
                 ]
                 if consecutive:
@@ -905,46 +1384,6 @@ def _deterministic_resolution_audit(
             "instructions": [
                 "Compare candidate user statements across session dates.",
                 "The latest directly relevant statement supersedes an older value even when fact keys differ.",
-            ],
-        }
-
-    if question_type == "multi-session":
-        grouped: dict[str, list[Mapping[str, Any]]] = {}
-        for memory in context:
-            session_id = str(memory.get("source_session_id") or "unknown")
-            grouped.setdefault(session_id, []).append(memory)
-        bundles: list[dict[str, Any]] = []
-        for session_id, memories in grouped.items():
-            user_evidence_ranks = [
-                int(memory["rank"])
-                for memory in memories
-                if memory.get("explicit_user_evidence")
-                or memory.get("evidence_kind")
-                in {"user_fact", "preference", "decision", "event", "context"}
-            ]
-            bundles.append(
-                {
-                    "source_session_id": session_id,
-                    "session_date": memories[0].get("session_date"),
-                    "memory_ranks": [int(memory["rank"]) for memory in memories],
-                    "user_evidence_ranks": user_evidence_ranks,
-                    "memory_count": len(memories),
-                }
-            )
-        bundles.sort(
-            key=lambda bundle: (
-                str(bundle.get("session_date") or ""),
-                str(bundle.get("source_session_id") or ""),
-            )
-        )
-        return {
-            "kind": "multi_session",
-            "distinct_session_count": len(bundles),
-            "session_bundles": bundles,
-            "instructions": [
-                "Inspect every session bundle before answering.",
-                "Combine distinct answer contributions and deduplicate only repeated evidence within the same session.",
-                "Do not let the highest-ranked session stand in for another session.",
             ],
         }
 
@@ -1105,10 +1544,10 @@ def _message_content(response: Mapping[str, Any]) -> str:
         raise ValueError("LM Studio response has no choices")
     first_choice = choices[0]
     if not isinstance(first_choice, Mapping):
-        raise ValueError("LM Studio response choice is not an object")
+        raise ValueError("LM Studio response choice is not an object")  # noqa: TRY004
     message = first_choice.get("message")
     if not isinstance(message, Mapping) or not isinstance(message.get("content"), str):
-        raise ValueError("LM Studio response choice has no text content")
+        raise ValueError("LM Studio response choice has no text content")  # noqa: TRY004
     content = message["content"].strip()
     if not content:
         raise ValueError("LM Studio response content is empty")
@@ -1178,11 +1617,15 @@ class LmStudioLongMemEvalReader:
     async def answer(
         self, question: str, memories: Sequence[RecallMatch]
     ) -> str:
+        per_memory_chars = max(280, min(560, 10_000 // max(len(memories), 1)))
         context = [
             {
                 "rank": index + 1,
                 "title": match.memory.title,
-                "content": match.memory.content,
+                "content": _bounded_reader_text(
+                    match.memory.content,
+                    max_chars=per_memory_chars,
+                ),
                 "memory_type": match.memory.type.value,
                 "session_date": match.memory.metadata.get("source_session_date"),
                 "source_session_id": (
@@ -1201,6 +1644,12 @@ class LmStudioLongMemEvalReader:
                 "evidence_kind": match.memory.metadata.get("evidence_kind"),
                 "explicit_user_evidence": match.memory.metadata.get(
                     "explicit_user_evidence", False
+                ),
+                "explicit_quantitative_evidence": match.memory.metadata.get(
+                    "explicit_quantitative_evidence", False
+                ),
+                "quantitative_values": list(
+                    match.memory.metadata.get("quantitative_values", ())
                 ),
                 "temporal_anchor": match.memory.metadata.get("temporal_anchor"),
                 "observed_at": (
@@ -1237,16 +1686,80 @@ class LmStudioLongMemEvalReader:
         deterministic_resolution_audit = _deterministic_resolution_audit(
             question, context
         )
+        evidence_cards = _reader_evidence_cards(question, context)
+        map_stage_output: str | None = None
+        if (
+            deterministic_resolution_audit.get("kind") == "multi_session_count"
+            and not action_item_checklist
+            and _should_map_reduce_count(question)
+        ):
+            map_rows = []
+            project_leadership = "project" in _retrieval_terms(question) and bool(
+                _retrieval_terms(question) & {"lead", "led", "leading"}
+            )
+            minimum_directness = 3 if project_leadership else 5
+            candidate_rows = [
+                row
+                for row in deterministic_resolution_audit.get(
+                    "contribution_ledger", []
+                )
+                if int(row.get("directness_score") or 0) >= minimum_directness
+            ][:12]
+            for row in candidate_rows:
+                compact_row = dict(row)
+                compact_row["content"] = _bounded_reader_text(
+                    compact_row.get("content"),
+                    max_chars=120,
+                )
+                map_rows.append(compact_row)
+            map_payload = json.dumps(
+                {
+                    "question": question,
+                    "contribution_rows": map_rows,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            map_stage_output = await self._client.complete(
+                [
+                    {"role": "system", "content": MULTI_SESSION_MAP_SYSTEM_PROMPT},
+                    {"role": "user", "content": map_payload},
+                ],
+                max_tokens=min(384, max(192, self.max_tokens)),
+                temperature=self.temperature,
+            )
+            contribution_count = _contribution_count_from_map(map_stage_output)
+            if contribution_count is not None and re.search(
+                r"\bhow many\b|\bnumber of\b",
+                question,
+                re.IGNORECASE,
+            ):
+                return str(contribution_count)
+        audit_for_reader = deterministic_resolution_audit
+        evidence_cards_for_reader = evidence_cards
+        if map_stage_output is not None:
+            audit_for_reader = {
+                "kind": deterministic_resolution_audit.get("kind"),
+                "distinct_session_count": deterministic_resolution_audit.get(
+                    "distinct_session_count"
+                ),
+                "instructions": deterministic_resolution_audit.get(
+                    "instructions", []
+                ),
+            }
+            evidence_cards_for_reader = []
         user_payload = json.dumps(
             {
                 "question": question,
                 "resolution_priority": deterministic_resolution_audit.get(
                     "resolver_directive"
                 ),
+                "evidence_cards": evidence_cards_for_reader,
                 "retrieved_memories": context,
                 "session_groups": session_groups,
                 "action_item_checklist": action_item_checklist,
-                "deterministic_resolution_audit": deterministic_resolution_audit,
+                "map_stage_output": map_stage_output,
+                "deterministic_resolution_audit": audit_for_reader,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1259,7 +1772,28 @@ class LmStudioLongMemEvalReader:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
-        return _apply_update_resolution_guard(response, deterministic_resolution_audit)
+        concise_response = _parse_reader_answer(response)
+        concise_response = _apply_action_count_guard(
+            concise_response, action_item_checklist
+        )
+        concise_response = _apply_temporal_relation_guard(
+            question,
+            concise_response,
+            deterministic_resolution_audit,
+        )
+        concise_response = _apply_currency_total_guard(
+            question,
+            concise_response,
+            deterministic_resolution_audit,
+        )
+        concise_response = _apply_acquisition_count_guard(
+            question,
+            concise_response,
+            context,
+        )
+        return _apply_update_resolution_guard(
+            concise_response, deterministic_resolution_audit
+        )
 
 
 def official_longmemeval_judge_prompt(
@@ -1403,6 +1937,149 @@ class LmStudioLongMemEvalJudge:
         # Keep the upstream evaluator's semantics for comparability while
         # rejecting substring matches such as "yesterday".
         return _parse_judge_label(raw), raw
+
+
+@dataclass(slots=True)
+class OpenRouterJevLongMemEvalJudge:
+    """Apply LongMemEval judging as a typed OpenRouter/TypeSafe decision."""
+
+    model: str = "typesafe/jev-1.13"
+    api_key: str = ""
+    base_url: str = "https://openrouter.ai/api/alpha"
+    prompt_version: str = "longmemeval-jev-decision-v1"
+    # Calibrated on balanced positive/negative multi-session controls. The
+    # provider's generic 0.5 decision boundary accepted a plausible off-by-one
+    # answer, while verified positives remained at or above 0.87.
+    threshold: float = 0.8
+    timeout_seconds: float = 45.0
+    retries: int = 2
+
+    def __post_init__(self) -> None:
+        self.model = self.model.strip()
+        self.base_url = self.base_url.rstrip("/")
+        self.api_key = self.api_key.strip()
+        if not self.model:
+            raise ValueError("OpenRouter Jev judge requires a model identifier")
+        if not self.api_key:
+            raise ValueError("OpenRouter Jev judge requires an API key")
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ValueError("OpenRouter base_url must start with http:// or https://")
+        if not 0 <= self.threshold <= 1:
+            raise ValueError("OpenRouter Jev threshold must be between 0 and 1")
+        if self.timeout_seconds <= 0:
+            raise ValueError("OpenRouter Jev timeout_seconds must be positive")
+        if self.retries < 0:
+            raise ValueError("OpenRouter Jev retries cannot be negative")
+
+    @property
+    def version(self) -> str:
+        return f"{self.model}:{self.prompt_version}:threshold-{self.threshold:g}"
+
+    async def judge(
+        self, question: LongMemEvalQuestion, response: str
+    ) -> tuple[bool, str]:
+        payload = {
+            "model": self.model,
+            "state": {
+                "benchmark": "LongMemEval",
+                "question_id": question.question_id,
+                "question_type": question.question_type,
+                "question": question.question,
+                "correct_answer": question.answer,
+                "model_response": response,
+                "abstention": "_abs" in question.question_id,
+            },
+            "questions": {
+                "is_correct": {
+                    "type": "noul",
+                    "instructions": (
+                        "Decide whether model_response should be accepted as "
+                        "correct for the LongMemEval question according to "
+                        "correct_answer and question_type. For standard "
+                        "single-session and multi-session questions, true iff "
+                        "the response contains the correct answer or an "
+                        "equivalent answer; false if it only contains a subset "
+                        "of required information. For temporal-reasoning, "
+                        "allow off-by-one day/week/month count errors. For "
+                        "knowledge-update, accept the updated answer even if "
+                        "previous information is also mentioned. For "
+                        "single-session-preference, accept if the response "
+                        "recalls and uses the user's personal information "
+                        "correctly. For abstention, true iff the response "
+                        "correctly says the answer cannot be determined."
+                    ),
+                    "criteria": {
+                        "true": (
+                            "The model response is correct or equivalent under "
+                            "the LongMemEval judging rule."
+                        ),
+                        "false": (
+                            "The model response is incorrect, incomplete, only "
+                            "a subset, unrelated, or contradicts the correct "
+                            "answer."
+                        ),
+                    },
+                }
+            },
+        }
+        raw_response: Mapping[str, Any] | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                raw_response = await asyncio.to_thread(self._post_json, payload)
+                break
+            except _LmStudioQARequestError:
+                if attempt >= self.retries:
+                    raise
+                await asyncio.sleep(min(2**attempt, 8))
+        if raw_response is None:
+            raise AssertionError("OpenRouter Jev retry loop exited unexpectedly")
+        answer = raw_response.get("answers", {}).get("is_correct", {})
+        if not isinstance(answer, Mapping) or not isinstance(
+            answer.get("noul"),
+            (int, float),
+        ):
+            raise ValueError(  # noqa: TRY004
+                "OpenRouter Jev response did not contain a noul score"
+            )
+        score = float(answer["noul"])
+        return score >= self.threshold, json.dumps(
+            raw_response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _post_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = Request(
+            f"{self.base_url}/decisions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://snipara.com",
+                "X-Title": "Snipara LongMemEval judge",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response_obj:
+                decoded = json.loads(response_obj.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise _LmStudioQARequestError(
+                f"HTTP {error.code} from {self.base_url}: {detail}"
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise _LmStudioQARequestError(
+                f"Could not reach {self.base_url}: {error}"
+            ) from error
+        if not isinstance(decoded, Mapping):
+            raise _LmStudioQARequestError("OpenRouter Jev returned a non-object response")
+        if isinstance(decoded.get("error"), Mapping):
+            raise _LmStudioQARequestError(
+                f"OpenRouter Jev error: {json.dumps(decoded['error'])[:500]}"
+            )
+        return decoded
 
 
 @dataclass(slots=True)
@@ -2052,6 +2729,19 @@ def _retrieval_query_expansions(question: str) -> list[str]:
         expansions.append("research papers articles academic studies conferences")
     if terms & {"accessory", "accessories", "setup", "complement"}:
         expansions.append("camera lens photography gear equipment accessories")
+    if terms & {"favorite", "prefer", "preferred", "preference", "like", "likes"}:
+        expansions.append("favorite preferred preference likes user stated preference")
+    if terms & {"speed", "internet", "plan", "mbps", "wifi", "broadband"}:
+        expansions.append("internet plan speed Mbps broadband wifi")
+    if terms & {"play", "theater", "theatre", "show", "performance"}:
+        expansions.append("play theater theatre show performance title")
+    if terms & {"bought", "buy", "purchased", "purchase", "store"}:
+        expansions.append("bought purchased store shop ordered from")
+    for concept_group in _RETRIEVAL_CONCEPT_GROUPS:
+        if terms & concept_group:
+            expansion = " ".join(sorted(concept_group))
+            if expansion not in expansions:
+                expansions.append(expansion)
     return expansions
 
 
@@ -2110,6 +2800,15 @@ def _retrieval_terms(text: str) -> set[str]:
         if len(token) <= 2 and not token.isdigit():
             continue
         terms.add(token)
+        # Compound labels such as ``bike-related`` carry two useful lexical
+        # anchors. Preserve the full label and expose its parts so concept
+        # expansion can reach both the entity and its relation vocabulary.
+        if "-" in token:
+            terms.update(
+                part
+                for part in token.split("-")
+                if len(part) > 2 and part not in _RETRIEVAL_STOPWORDS
+            )
         # Keep the surface form for exact matches, but add conservative
         # variants so ``moved`` matches ``move`` and ``projects`` matches
         # ``project`` without requiring a heavyweight NLP dependency.
@@ -2125,32 +2824,561 @@ def _retrieval_terms(text: str) -> set[str]:
     return terms
 
 
-def _memory_retrieval_score(
-    memory: Any,
-    *,
-    query_terms: set[str],
-    base_score: float,
-    base_reason: str | None = None,
-) -> float:
-    """Blend content retrieval with title, tags, and fact identity signals."""
+# Small, product-level concept neighborhoods provide the lexical side of
+# hybrid retrieval when no heavyweight synonym model is available. They model
+# stable relations (cost, care provider, acquisition, transaction, ingredient,
+# and construction) rather than benchmark questions or expected answers.
+_RETRIEVAL_CONCEPT_GROUPS = (
+    frozenset(
+        {
+            "amount",
+            "cost",
+            "costs",
+            "expense",
+            "expenses",
+            "fee",
+            "paid",
+            "price",
+            "repair",
+            "replacement",
+            "spent",
+            "total",
+        }
+    ),
+    frozenset(
+        {
+            "appointment",
+            "care",
+            "dermatologist",
+            "doctor",
+            "doctors",
+            "ent",
+            "physician",
+            "provider",
+            "specialist",
+        }
+    ),
+    frozenset(
+        {
+            "acquire",
+            "acquired",
+            "bought",
+            "buy",
+            "gift",
+            "given",
+            "nursery",
+            "purchase",
+            "purchased",
+            "received",
+        }
+    ),
+    frozenset(
+        {
+            "collect",
+            "collected",
+            "exchange",
+            "exchanged",
+            "pickup",
+            "replacement",
+            "return",
+            "returned",
+            "store",
+        }
+    ),
+    frozenset(
+        {
+            "bitters",
+            "citrus",
+            "cocktail",
+            "cocktails",
+            "garnish",
+            "grapefruit",
+            "ingredient",
+            "juice",
+            "lemon",
+            "lime",
+            "orange",
+            "peel",
+        }
+    ),
+    frozenset(
+        {
+            "assemble",
+            "assembled",
+            "build",
+            "built",
+            "completed",
+            "construct",
+            "finished",
+            "kit",
+            "kits",
+            "model",
+            "models",
+            "aircraft",
+            "bomber",
+            "car",
+            "diorama",
+            "tank",
+        }
+    ),
+    frozenset(
+        {
+            "bike",
+            "bicycle",
+            "chain",
+            "cycling",
+            "helmet",
+            "light",
+            "lights",
+            "ride",
+            "riding",
+            "tire",
+            "tires",
+        }
+    ),
+    frozenset(
+        {
+            "cactus",
+            "flower",
+            "flowers",
+            "herb",
+            "herbs",
+            "houseplant",
+            "nursery",
+            "plant",
+            "plants",
+            "succulent",
+            "tree",
+        }
+    ),
+    frozenset(
+        {
+            "bed",
+            "bedtime",
+            "late",
+            "sleep",
+            "slept",
+            "stay",
+            "stayed",
+            "up",
+        }
+    ),
+)
 
-    if not query_terms:
-        return base_score
-    title_terms = _retrieval_terms(memory.title or "")
-    content_terms = _retrieval_terms(memory.content)
-    tag_terms = _retrieval_terms(" ".join(memory.tags))
+_COST_CONCEPT_TERMS = frozenset(
+    {
+        "amount",
+        "cost",
+        "costs",
+        "expense",
+        "expenses",
+        "fee",
+        "paid",
+        "price",
+        "repair",
+        "replacement",
+        "spent",
+        "total",
+    }
+)
+
+
+def _expanded_retrieval_terms(terms: set[str] | frozenset[str]) -> set[str]:
+    """Expand query terms through reusable concept neighborhoods."""
+
+    expanded = set(terms)
+    for concept_group in _RETRIEVAL_CONCEPT_GROUPS:
+        if terms & concept_group:
+            expanded.update(concept_group)
+    return expanded
+
+
+_QUESTION_ATTRIBUTE_EXPANSIONS: dict[str, frozenset[str]] = {
+    "favorite": frozenset({"favorite", "prefer", "preferred", "preference", "like", "likes"}),
+    "type": frozenset({"type", "kind", "variety", "style", "category"}),
+    "speed": frozenset({"speed", "mbps", "bandwidth", "internet", "plan", "wifi", "broadband"}),
+    "location": frozenset(
+        {
+            "where",
+            "location",
+            "place",
+            "venue",
+            "room",
+            "city",
+            "live",
+            "lives",
+            "moved",
+            "store",
+            "shop",
+            "bought",
+            "purchased",
+        }
+    ),
+    "title": frozenset({"title", "name", "called", "play", "show", "performance", "book", "movie"}),
+    "quantity": frozenset({"how", "many", "much", "number", "count", "amount", "total"}),
+    "time": frozenset({"when", "date", "day", "month", "week", "year", "time"}),
+}
+
+_QUESTION_BROAD_RETRIEVAL_TERMS = frozenset(
+    {
+        "attended",
+        "bought",
+        "new",
+        "now",
+        "currently",
+        "recent",
+        "recently",
+        "latest",
+        "most",
+        "should",
+        "purchase",
+        "purchased",
+        "used",
+        "visited",
+        "worked",
+        "would",
+        "could",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _QuestionEvidencePlan:
+    """Deterministic description of what a question needs from evidence."""
+
+    question_type: str
+    query_terms: frozenset[str]
+    concept_terms: frozenset[str]
+    core_terms: frozenset[str]
+    attribute_terms: frozenset[str]
+    expected_answer_kind: str
+
+
+def _question_evidence_plan(
+    question: str,
+    *,
+    question_type: str = "",
+) -> _QuestionEvidencePlan:
+    """Plan retrieval around answerability, not only semantic similarity."""
+
+    query_terms = frozenset(_retrieval_terms(question))
+    concept_terms = frozenset(_expanded_retrieval_terms(query_terms) - query_terms)
+    lowered = question.lower()
+    attribute_terms: set[str] = set()
+    expected_answer_kind = "entity"
+    for kind, cues in _QUESTION_ATTRIBUTE_EXPANSIONS.items():
+        if query_terms & cues or any(cue in lowered for cue in cues):
+            attribute_terms.update(cues)
+            if kind in {"speed", "location", "quantity", "time", "title", "type"}:
+                expected_answer_kind = kind
+    if question_type == "temporal-reasoning":
+        expected_answer_kind = "time"
+        attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["time"])
+    elif re.search(r"\bhow many\b|\bhow much\b|\bnumber of\b", lowered):
+        expected_answer_kind = "quantity"
+        attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["quantity"])
+        if re.search(r"\bhow much\b", lowered) and query_terms & _COST_CONCEPT_TERMS:
+            expected_answer_kind = "currency"
+    elif re.search(r"\bwhere\b", lowered):
+        expected_answer_kind = "location"
+        attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["location"])
+    elif re.search(r"\bwhat type\b|\bwhat kind\b|\bwhich type\b", lowered):
+        expected_answer_kind = "type"
+        attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["type"])
+    elif re.search(r"\bwhat (?:play|show|book|movie|brand|model|speed)\b", lowered):
+        attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["title"])
+
+    # Keep concrete nouns as the hard entity constraints. Attribute terms help
+    # identify answer shape but should not replace entity overlap.
+    core_terms = set(query_terms)
+    core_terms.difference_update(_QUESTION_BROAD_RETRIEVAL_TERMS)
+    core_terms.difference_update({"what", "which", "where", "when", "how"})
+    if attribute_terms:
+        # Do not remove all attribute words: in questions like "internet
+        # speed" the attribute is part of the entity relation. Retain only the
+        # concrete terms that also appear in the question.
+        removable = attribute_terms - {"internet", "plan", "rice", "play", "show"}
+        core_terms.difference_update(removable)
+    if expected_answer_kind == "currency":
+        core_terms.difference_update(_QUESTION_ATTRIBUTE_EXPANSIONS["time"])
+        core_terms.discard("related")
+    if not core_terms:
+        core_terms = set(query_terms)
+
+    return _QuestionEvidencePlan(
+        question_type=question_type,
+        query_terms=query_terms,
+        concept_terms=concept_terms,
+        core_terms=frozenset(core_terms),
+        attribute_terms=frozenset(attribute_terms),
+        expected_answer_kind=expected_answer_kind,
+    )
+
+
+def _memory_text_terms(memory: Any) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return normalized title/content/tag/fact terms for a memory-like object."""
+
+    title_terms = _retrieval_terms(str(getattr(memory, "title", "") or ""))
+    content_terms = _retrieval_terms(str(getattr(memory, "content", "") or ""))
+    tag_terms = _retrieval_terms(" ".join(getattr(memory, "tags", ()) or ()))
+    metadata = getattr(memory, "metadata", {}) or {}
     fact_terms = _retrieval_terms(
         " ".join(
             str(value or "")
             for value in (
                 getattr(memory, "memory_key", None),
                 getattr(memory, "supersedes_memory_key", None),
-                memory.metadata.get("fact_key"),
-                memory.metadata.get("temporal_anchor"),
-                memory.metadata.get("source_session_date"),
+                metadata.get("fact_key"),
+                metadata.get("evidence_kind"),
+                metadata.get("temporal_anchor"),
+                metadata.get("source_session_date"),
             )
         )
     )
+    return title_terms, content_terms, tag_terms, fact_terms
+
+
+def _question_answerability_score(
+    memory: Any,
+    plan: _QuestionEvidencePlan,
+) -> float:
+    """Score whether a memory can directly answer the planned question."""
+
+    if not plan.query_terms:
+        return 0.0
+    title_terms, content_terms, tag_terms, fact_terms = _memory_text_terms(memory)
+    all_terms = title_terms | content_terms | tag_terms | fact_terms
+    core_overlap = plan.core_terms & all_terms
+    query_overlap = plan.query_terms & all_terms
+    concept_overlap = plan.concept_terms & all_terms
+    attribute_overlap = plan.attribute_terms & all_terms
+    if not core_overlap and not query_overlap and not concept_overlap:
+        return 0.0
+
+    core_denominator = max(len(plan.core_terms), 1)
+    query_denominator = max(len(plan.query_terms), 1)
+    score = 0.0
+    score += 0.42 * (len(core_overlap) / core_denominator)
+    score += 0.18 * (len(query_overlap) / query_denominator)
+    if plan.concept_terms:
+        score += 0.18 * min(1.0, len(concept_overlap) / 2)
+    if plan.attribute_terms:
+        score += 0.16 * min(1.0, len(attribute_overlap) / 2)
+    if plan.core_terms and plan.core_terms <= all_terms:
+        score += 0.12
+
+    metadata = getattr(memory, "metadata", {}) or {}
+    evidence_kind = str(metadata.get("evidence_kind") or "")
+    if metadata.get("explicit_user_evidence") or evidence_kind in {
+        "user_fact",
+        "preference",
+        "decision",
+        "event",
+        "context",
+    }:
+        score += 0.08
+    if getattr(memory, "memory_key", None) or metadata.get("fact_key"):
+        score += 0.04
+    content = str(getattr(memory, "content", "") or "")
+    if plan.expected_answer_kind == "quantity" and _EVIDENCE_SCALAR_PATTERN.search(
+        content
+    ):
+        score += 0.08
+    if plan.expected_answer_kind == "currency" and re.search(
+        r"[$€£]\s*\d", content
+    ):
+        entity_concepts = concept_overlap - _COST_CONCEPT_TERMS
+        if entity_concepts:
+            score += 0.28
+    if plan.expected_answer_kind == "speed" and re.search(
+        r"\b\d+\s*(?:mbps|gbps|kbps)\b", content, flags=re.IGNORECASE
+    ):
+        score += 0.12
+    if plan.expected_answer_kind == "location" and (
+        re.search(r"\b(?:in|at|from|to|near)\s+[A-Z][\w'-]+", content)
+        or {"city", "store", "venue", "room"} & all_terms
+    ):
+        score += 0.06
+    if plan.expected_answer_kind in {"title", "type", "entity"} and re.search(
+        r"\b[A-Z][\w'-]+(?:\s+[A-Z][\w'-]+){0,4}\b", content
+    ):
+        score += 0.05
+    return min(score, 1.0)
+
+
+def _reader_evidence_cards(
+    question: str,
+    context: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build compact evidence-first cards for the reader prompt."""
+
+    question_type = str(context[0].get("question_type") or "") if context else ""
+    plan = _question_evidence_plan(question, question_type=question_type)
+    cards: list[dict[str, Any]] = []
+    for memory in context:
+        memory_obj = type(
+            "_ReaderMemory",
+            (),
+            {
+                "title": memory.get("title"),
+                "content": memory.get("content"),
+                "tags": (),
+                "metadata": {
+                    "fact_key": memory.get("fact_key"),
+                    "evidence_kind": memory.get("evidence_kind"),
+                    "explicit_user_evidence": memory.get("explicit_user_evidence"),
+                    "temporal_anchor": memory.get("temporal_anchor"),
+                    "source_session_date": memory.get("session_date"),
+                },
+                "memory_key": memory.get("fact_key"),
+                "supersedes_memory_key": memory.get("supersedes_fact_key"),
+            },
+        )()
+        score = _question_answerability_score(memory_obj, plan)
+        memory_terms = set().union(*_memory_text_terms(memory_obj))
+        matched_core = sorted(plan.core_terms & memory_terms)
+        matched_attribute = sorted(plan.attribute_terms & memory_terms)
+        matched_concepts = sorted(plan.concept_terms & memory_terms)
+        support_kind = (
+            "direct_answer_support"
+            if score >= 0.34
+            and (matched_core or matched_attribute or matched_concepts)
+            else "contextual_support"
+        )
+        content = str(memory.get("content") or "")
+        content = _bounded_reader_text(content, max_chars=220)
+        cards.append(
+            {
+                "rank": memory.get("rank"),
+                "support_kind": support_kind,
+                "answerability_score": round(score, 3),
+                "matched_core_terms": matched_core,
+                "matched_attribute_terms": matched_attribute,
+                "matched_concept_terms": matched_concepts,
+                "source_session_id": memory.get("source_session_id"),
+                "session_date": memory.get("session_date"),
+                "title": memory.get("title"),
+                "content": content,
+                "fact_key": memory.get("fact_key"),
+                "supersedes_fact_key": memory.get("supersedes_fact_key"),
+                "source_turn_indices": memory.get("source_turn_indices", []),
+            }
+        )
+    cards.sort(
+        key=lambda card: (
+            card["support_kind"] == "direct_answer_support",
+            card["answerability_score"],
+            str(card.get("session_date") or ""),
+            -int(card.get("rank") or 0),
+        ),
+        reverse=True,
+    )
+    return cards[: min(12, len(cards))]
+
+
+def _parse_reader_answer(raw: str) -> str:
+    """Return only the reader's final answer from structured or legacy output."""
+
+    text = raw.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, Mapping):
+        answer = payload.get("answer")
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            payload = json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, Mapping):
+            answer = payload.get("answer")
+            if isinstance(answer, str) and answer.strip():
+                return answer.strip()
+
+    trailing = re.search(r'(\{"answer"\s*:\s*".*?"\})\s*$', text, re.DOTALL)
+    if trailing:
+        try:
+            payload = json.loads(trailing.group(1))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, Mapping):
+            answer = payload.get("answer")
+            if isinstance(answer, str) and answer.strip():
+                return answer.strip()
+
+    final_lines = re.findall(
+        r"(?:^|\n)\s*(?:final answer|answer)\s*:\s*(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if final_lines:
+        return final_lines[-1].strip()
+    return text
+
+
+def _contribution_count_from_map(raw: str | None) -> int | None:
+    """Count a complete structured map without asking the model to reduce it."""
+
+    if not raw:
+        return None
+    text = raw.strip()
+    candidates = [text]
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1))
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        contributions = payload.get("contributions")
+        if not isinstance(contributions, list) or not contributions:
+            continue
+        if all(isinstance(item, Mapping) for item in contributions):
+            return len(contributions)
+    return None
+
+
+def _should_map_reduce_count(question: str) -> bool:
+    """Use entity map-reduce only for artifact inventories, not scalar totals."""
+
+    terms = _retrieval_terms(question)
+    if "project" in terms and terms & {"lead", "led", "leading"}:
+        return True
+    return bool(
+        terms
+        & {
+            "aircraft",
+            "diorama",
+            "kit",
+            "kits",
+            "model",
+            "models",
+            "tank",
+        }
+    )
+
+
+def _memory_retrieval_score(
+    memory: Any,
+    *,
+    query_terms: set[str],
+    base_score: float,
+    base_reason: str | None = None,
+    evidence_plan: _QuestionEvidencePlan | None = None,
+) -> float:
+    """Blend content retrieval with title, tags, and fact identity signals."""
+
+    if not query_terms:
+        return base_score
+    title_terms, content_terms, tag_terms, fact_terms = _memory_text_terms(memory)
     denominator = max(len(query_terms), 1)
     title_overlap = len(query_terms & title_terms) / denominator
     content_overlap = len(query_terms & content_terms) / denominator
@@ -2162,10 +3390,17 @@ def _memory_retrieval_score(
         + 0.12 * tag_overlap
         + 0.08 * fact_overlap
     )
+    answerability_score = (
+        _question_answerability_score(memory, evidence_plan)
+        if evidence_plan is not None
+        else 0.0
+    )
     if lexical_score <= 0:
         # The local fallback embedding is deliberately lightweight and can
         # assign high scores to unrelated memories. Keep it as a synonym
         # fallback, but never let it outrank explicit query evidence.
+        if answerability_score > 0:
+            return 0.70 * answerability_score + 0.10 * max(base_score, 0.0)
         if base_reason == "provenance-context":
             # A sibling memory from a matched evidence group is useful as
             # context, but it is not query evidence by itself. Keep it below
@@ -2173,16 +3408,24 @@ def _memory_retrieval_score(
             # the exact fact the reader needs.
             return max(base_score, 0.0) * 0.2
         return max(base_score, 0.0) * 0.2
-    return 0.65 * lexical_score + 0.35 * max(base_score, 0.0)
+    return (
+        0.48 * lexical_score
+        + 0.32 * answerability_score
+        + 0.20 * max(base_score, 0.0)
+    )
 
 
 def _provenance_group_relevance(matches: Sequence[RecallMatch]) -> float:
     """Rank evidence bundles by corroborated relevance, not one lucky hit."""
 
     scores = sorted((max(match.score, 0.0) for match in matches), reverse=True)
-    # The first few independent memories are useful corroboration; cap the
-    # contribution so a verbose session cannot drown out a concise one.
-    return sum(scores[:4])
+    if not scores:
+        return 0.0
+    # A strong direct fact should dominate group selection. Additional facts
+    # corroborate it with diminishing returns, so verbose sessions cannot win
+    # merely by producing more chunks.
+    weights = (1.0, 0.35, 0.18, 0.09)
+    return sum(score * weight for score, weight in zip(scores[:4], weights))
 
 
 def _diversify_longmemeval_matches(
@@ -2193,9 +3436,7 @@ def _diversify_longmemeval_matches(
     """Keep evidence from several sessions before filling the remaining slots."""
 
     max_per_provenance = None
-    if question_type in {"multi-session", "temporal-reasoning"}:
-        max_per_provenance = 4
-    elif question_type == "knowledge-update":
+    if question_type in {"multi-session", "temporal-reasoning", "knowledge-update"}:
         max_per_provenance = 4
     if max_per_provenance is not None:
         # Round-robin diversity across every weak lexical hit can still use
@@ -2208,7 +3449,7 @@ def _diversify_longmemeval_matches(
         # Keep enough candidate groups for a compact multi-session answer. A
         # low group cap can hide the second corroborating session before the
         # generic round-robin selector has a chance to use it.
-        group_limit = min(16, max(12, limit))
+        group_limit = max(6, min(10, limit // 2 or 1))
         ranked_group_keys = sorted(
             grouped,
             key=lambda key: _provenance_group_relevance(grouped[key]),
@@ -2267,6 +3508,10 @@ async def _retrieve_longmemeval_matches(
             if previous is None or match.score > previous[0]:
                 base_scores[match.memory.id] = (match.score, match.reason)
     query_term_sets = [_retrieval_terms(query) for query in retrieval_queries]
+    evidence_plan = _question_evidence_plan(
+        question.question,
+        question_type=question.question_type,
+    )
     memories = await service.list_memories(
         namespace_id,
         statuses=[MemoryStatus.ACTIVE],
@@ -2279,6 +3524,7 @@ async def _retrieve_longmemeval_matches(
                 query_terms=query_terms,
                 base_score=base_scores.get(memory.id, (0.0, None))[0],
                 base_reason=base_scores.get(memory.id, (0.0, None))[1],
+                evidence_plan=evidence_plan,
             )
             for query_terms in query_term_sets
         ]

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json
 from pathlib import Path
-import threading
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 from snipara_memory import (
     ExtractedFact,
@@ -19,11 +20,12 @@ from snipara_memory import (
     LmStudioLongMemEvalReader,
     LongMemEvalQACache,
     LongMemEvalQuestion,
+    LongMemEvalSession,
+    LongMemEvalTurn,
     MemoryService,
     MemoryStatus,
     MemoryType,
-    LongMemEvalSession,
-    LongMemEvalTurn,
+    OpenRouterJevLongMemEvalJudge,
     ingest_longmemeval_dataset,
     load_longmemeval_instances,
     official_longmemeval_judge_prompt,
@@ -36,11 +38,24 @@ from snipara_memory.longmemeval import (
 )
 from snipara_memory.qa import (
     READER_SYSTEM_PROMPT,
+    _apply_acquisition_count_guard,
+    _apply_action_count_guard,
+    _apply_currency_total_guard,
+    _apply_temporal_relation_guard,
     _action_item_checklist,
     _apply_update_resolution_guard,
+    _contribution_count_from_map,
     _deterministic_resolution_audit,
+    _expanded_retrieval_terms,
+    _named_event_mentions,
     _parse_judge_label,
+    _parse_reader_answer,
+    _question_answerability_score,
+    _question_evidence_plan,
     _reader_context_limit,
+    _reader_evidence_cards,
+    _retrieval_terms,
+    _should_map_reduce_count,
 )
 
 
@@ -838,12 +853,14 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v28" in reader.version
+    assert ":lmstudio-longmemeval-reader-v41" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
     assert "niece" in READER_SYSTEM_PROMPT
     assert "vintage\n  cameras" in READER_SYSTEM_PROMPT
     assert "unrelated\n  recommendations" in READER_SYSTEM_PROMPT
+    assert "scale vehicle or aircraft diorama" in READER_SYSTEM_PROMPT
+    assert '{"answer":"..."}' in READER_SYSTEM_PROMPT
 
 
 def test_action_item_checklist_keeps_exchange_actions_distinct() -> None:
@@ -869,15 +886,230 @@ def test_action_item_checklist_keeps_exchange_actions_distinct() -> None:
     )
 
     assert checklist == [
-        {"source_session_id": "session-1", "action": "pickup", "item": "boots"},
+        {
+            "source_session_id": "session-1",
+            "action": "pickup",
+            "item": "boots",
+            "venue": "zara",
+        },
         {
             "source_session_id": "session-2",
             "action": "pickup",
-            "item": "dry cleaning",
+            "item": "blazer",
+            "venue": "dry cleaning",
         },
-        {"source_session_id": "session-3", "action": "pickup", "item": "boots"},
-        {"source_session_id": "session-3", "action": "return", "item": "boots"},
+        {
+            "source_session_id": "session-3",
+            "action": "return",
+            "item": "boots",
+            "venue": "zara",
+        },
     ]
+    assert _apply_action_count_guard("2", checklist) == "3"
+
+
+def test_action_item_checklist_excludes_personal_returns_without_store() -> None:
+    checklist = _action_item_checklist(
+        "How many items of clothing do I need to pick up or return from a store?",
+        [
+            {
+                "source_session_id": "family",
+                "content": "My sister will return my green sweater next week.",
+            },
+            {
+                "source_session_id": "shop",
+                "content": "I need to return my jacket to North Market.",
+            },
+        ],
+    )
+
+    assert checklist == [
+        {
+            "source_session_id": "shop",
+            "action": "return",
+            "item": "jacket",
+            "venue": "north market",
+        }
+    ]
+
+
+def test_action_item_checklist_models_both_sides_of_explicit_exchange() -> None:
+    checklist = _action_item_checklist(
+        "How many items of clothing do I need to pick up or return from a store?",
+        [
+            {
+                "source_session_id": "exchange",
+                "content": (
+                    "I exchanged my old boots at Zara; the replacement pair "
+                    "is ready there."
+                ),
+            }
+        ],
+    )
+
+    assert {(row["action"], row["item"], row["venue"]) for row in checklist} == {
+        ("return", "boots", "zara"),
+        ("pickup", "boots", "zara"),
+    }
+    assert _apply_action_count_guard("2", checklist) == "2"
+
+
+def test_multi_session_count_uses_contribution_ledger_not_latest_quantity() -> None:
+    audit = _deterministic_resolution_audit(
+        "How much total money did I spend on bike expenses?",
+        [
+            {
+                "rank": 1,
+                "question_type": "multi-session",
+                "source_session_id": "chain",
+                "session_date": "2024-01-01",
+                "content": "I paid $25 for a replacement bike chain.",
+                "evidence_kind": "user_fact",
+                "explicit_user_evidence": True,
+            },
+            {
+                "rank": 2,
+                "question_type": "multi-session",
+                "source_session_id": "helmet",
+                "session_date": "2024-02-01",
+                "content": "I spent $120 on a new bike helmet.",
+                "evidence_kind": "user_fact",
+                "explicit_user_evidence": True,
+            },
+        ],
+    )
+
+    assert audit["kind"] == "multi_session_count"
+    assert "resolver_directive" not in audit
+    assert [row["scalar_values"] for row in audit["contribution_ledger"]] == [
+        ["$25"],
+        ["$120"],
+    ]
+    assert len(audit["session_contribution_maps"]) == 2
+
+
+def test_retrieval_concepts_bridge_entities_and_answer_attributes() -> None:
+    doctor_terms = _expanded_retrieval_terms({"doctors"})
+    bike_terms = _expanded_retrieval_terms({"bike", "expenses"})
+    plant_terms = _expanded_retrieval_terms({"plants"})
+
+    assert {"physician", "dermatologist", "specialist"} <= doctor_terms
+    assert {"helmet", "chain", "cost", "paid"} <= bike_terms
+    assert {"succulent", "nursery", "houseplant"} <= plant_terms
+    assert {"bike", "related"} <= _retrieval_terms("bike-related expenses")
+
+
+def test_reader_answer_parser_keeps_only_structured_final_answer() -> None:
+    assert _parse_reader_answer('{"answer":"$185"}') == "$185"
+    assert _parse_reader_answer(
+        "I first estimated $165.\nFinal answer: $185"
+    ) == "$185"
+    assert _parse_reader_answer(
+        'The evidence combines two sessions.\n{"answer":"2 AM"}'
+    ) == "2 AM"
+
+
+def test_structured_contribution_map_has_deterministic_count() -> None:
+    assert (
+        _contribution_count_from_map(
+            '{"contributions":[{"label":"alpha"},{"label":"beta"}]}'
+        )
+        == 2
+    )
+    assert _contribution_count_from_map('{"contributions":[') is None
+    assert _should_map_reduce_count("How many model kits have I built?")
+    assert _should_map_reduce_count("How many projects have I led?")
+    assert not _should_map_reduce_count("How many weeks did the trip take?")
+
+
+def test_currency_total_guard_sums_distinct_events_and_deduplicates_repeats() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "contribution_ledger": [
+            {"content": "Bike chain replacement cost $25.", "scalar_values": ["$25"]},
+            {"content": "New bike lights cost $40.", "scalar_values": ["$40"]},
+            {"content": "I installed $40 bike lights.", "scalar_values": ["$40"]},
+            {"content": "A bike helmet cost $120.", "scalar_values": ["$120"]},
+        ],
+    }
+
+    assert (
+        _apply_currency_total_guard(
+            "How much total money did I spend on bike expenses?",
+            "$105",
+            audit,
+        )
+        == "$185"
+    )
+
+
+def test_acquisition_count_guard_counts_entities_not_inventory_mentions() -> None:
+    context = [
+        {"content": "I bought a peace lily and a succulent at the nursery."},
+        {"content": "I received a snake plant from my sister."},
+        {"content": "My collection also contains several tropical plants."},
+    ]
+
+    assert (
+        _apply_acquisition_count_guard(
+            "How many plants did I acquire?",
+            "2",
+            context,
+        )
+        == "3"
+    )
+
+
+def test_named_event_ledger_counts_entities_instead_of_sessions() -> None:
+    events = _named_event_mentions(
+        "I volunteered at Portland Film Festival, then attended AFI Fest and "
+        "Seattle International Film Festival."
+    )
+
+    assert events == [
+        "Portland Film Festival",
+        "AFI Fest",
+        "Seattle International Film Festival",
+    ]
+
+
+def test_multi_session_temporal_relation_keeps_relative_event_chain() -> None:
+    audit = _deterministic_resolution_audit(
+        "What time did I go to bed on the day before my appointment?",
+        [
+            {
+                "rank": 1,
+                "question_type": "multi-session",
+                "source_session_id": "sleep",
+                "session_date": "2023-05-29",
+                "content": "I stayed up until 2 AM the previous Wednesday.",
+                "evidence_kind": "user_fact",
+                "explicit_user_evidence": True,
+            },
+            {
+                "rank": 2,
+                "question_type": "multi-session",
+                "source_session_id": "appointment",
+                "session_date": "2023-05-25",
+                "content": "I had a doctor's appointment on Thursday.",
+                "evidence_kind": "user_fact",
+                "explicit_user_evidence": True,
+            },
+        ],
+    )
+
+    assert audit["kind"] == "multi_session_temporal_relation"
+    assert ["2 AM"] in [
+        row["scalar_values"] for row in audit["contribution_ledger"]
+    ]
+    assert (
+        _apply_temporal_relation_guard(
+            "What time did I go to bed on the day before my appointment?",
+            "I cannot determine that.",
+            audit,
+        )
+        == "2 AM"
+    )
 
 
 def test_preference_resolution_audit_preserves_temporal_qualifiers() -> None:
@@ -922,6 +1154,35 @@ def test_high_signal_augmentation_preserves_later_user_updates() -> None:
         "Rachel just moved back to the suburbs again.",
     ]
     assert all(fact.metadata["explicit_user_evidence"] for fact in facts)
+
+
+def test_high_signal_augmentation_preserves_quantified_user_evidence() -> None:
+    session = LongMemEvalSession(
+        session_id="numbers",
+        date="2024/02/01",
+        turns=(
+            LongMemEvalTurn(
+                role="user",
+                content="The bike lights cost $40 and the drive took six hours.",
+            ),
+            LongMemEvalTurn(
+                role="user",
+                content="I went to bed at 2 AM before the appointment.",
+            ),
+        ),
+    )
+
+    facts = _augment_high_signal_evidence(session, [])
+    quantitative = [
+        fact
+        for fact in facts
+        if fact.metadata.get("explicit_quantitative_evidence")
+    ]
+
+    assert [fact.metadata["quantitative_values"] for fact in quantitative] == [
+        ("$40", "six hours"),
+        ("2 AM",),
+    ]
 
 
 def test_resolution_audit_prefers_latest_update_without_gold_fields() -> None:
@@ -1008,6 +1269,76 @@ def test_reader_context_expands_only_where_cross_session_evidence_is_needed() ->
     assert _reader_context_limit("temporal-reasoning", 8) == 18
     assert _reader_context_limit("knowledge-update", 8) == 24
     assert _reader_context_limit("single-session-user", 8) == 16
+
+
+def test_answerability_prefers_direct_attribute_evidence() -> None:
+    plan = _question_evidence_plan(
+        "What speed is my new internet plan?",
+        question_type="single-session-user",
+    )
+    direct = SimpleNamespace(
+        title="Internet plan upgrade",
+        content="The user upgraded the home internet plan to 500 Mbps.",
+        tags=("longmemeval",),
+        metadata={
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+            "fact_key": "internet.plan.speed",
+        },
+        memory_key="internet.plan.speed",
+        supersedes_memory_key=None,
+    )
+    distractor = SimpleNamespace(
+        title="Backup drive",
+        content="The user trusts the Western Digital 2TB drive for backups.",
+        tags=("longmemeval",),
+        metadata={
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+            "fact_key": "backup.drive",
+        },
+        memory_key="backup.drive",
+        supersedes_memory_key=None,
+    )
+
+    assert _question_answerability_score(direct, plan) > 0.6
+    assert _question_answerability_score(direct, plan) > (
+        _question_answerability_score(distractor, plan) + 0.4
+    )
+
+
+def test_reader_evidence_cards_surface_direct_support_first() -> None:
+    cards = _reader_evidence_cards(
+        "What type of rice is my favorite?",
+        [
+            {
+                "rank": 1,
+                "source_session_id": "session-tea",
+                "session_date": "2024-01-01",
+                "question_type": "single-session-user",
+                "title": "Tea preference",
+                "content": "The user prefers jasmine tea in the morning.",
+                "evidence_kind": "preference",
+                "explicit_user_evidence": True,
+                "fact_key": "user.preference.tea",
+            },
+            {
+                "rank": 2,
+                "source_session_id": "session-rice",
+                "session_date": "2024-01-02",
+                "question_type": "single-session-user",
+                "title": "Rice preference",
+                "content": "The user's favorite rice is Japanese short-grain rice.",
+                "evidence_kind": "preference",
+                "explicit_user_evidence": True,
+                "fact_key": "user.preference.rice",
+            },
+        ],
+    )
+
+    assert cards[0]["source_session_id"] == "session-rice"
+    assert cards[0]["support_kind"] == "direct_answer_support"
+    assert "Japanese short-grain rice" in cards[0]["content"]
 
 
 class FakeReader:
@@ -1167,6 +1498,8 @@ async def test_reader_payload_preserves_turn_provenance_and_session_bundle() -> 
         captured = json.loads(server.requests[0]["messages"][1]["content"])
 
     assert captured["retrieved_memories"][0]["source_turn_indices"] == [3]
+    assert captured["evidence_cards"][0]["source_turn_indices"] == [3]
+    assert captured["evidence_cards"][0]["support_kind"] == "direct_answer_support"
     assert captured["session_groups"][0]["user_evidence_ranks"] == [1]
     assert captured["deterministic_resolution_audit"]["kind"] == "multi_session"
     assert captured["deterministic_resolution_audit"]["distinct_session_count"] == 1
@@ -1316,3 +1649,47 @@ async def test_lm_studio_reader_and_judge_use_separate_qa_contracts() -> None:
         assert label is True
         assert raw == "yes"
         assert "updated answer" in server.requests[0]["messages"][0]["content"]
+
+
+async def test_openrouter_jev_judge_uses_decision_contract() -> None:
+    question = LongMemEvalQuestion.from_payload(_question_payload())
+    response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.91}},
+        "usage": {"input_tokens": 100, "output_tokens": 1, "cost": 0.00001},
+    }
+
+    with _json_server(response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            model="typesafe/jev-1.13",
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, raw = await judge.judge(question, "The user now lives in Zurich.")
+
+    assert label is True
+    assert "typesafe/jev-1.13-20260917" in raw
+    payload = server.requests[0]
+    assert payload["model"] == "typesafe/jev-1.13"
+    assert payload["state"]["question"] == "Where do I live now?"
+    assert payload["questions"]["is_correct"]["type"] == "noul"
+    assert judge.threshold == 0.8
+
+
+async def test_openrouter_jev_judge_rejects_below_calibrated_threshold() -> None:
+    question = LongMemEvalQuestion.from_payload(_question_payload())
+    response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.73}},
+    }
+
+    with _json_server(response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, _ = await judge.judge(question, "Paris")
+
+    assert label is False

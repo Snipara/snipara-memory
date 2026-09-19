@@ -64,7 +64,7 @@ class RecallBody(BaseModel):
 
 def create_app(service: MemoryService) -> FastAPI:
     """Create a standalone API app around the memory service."""
-    app = FastAPI(title="snipara-memory", version="0.1.0")
+    app = FastAPI(title="snipara-memory", version="0.1.2")
 
     @app.get("/health")
     async def health() -> dict[str, str]:
