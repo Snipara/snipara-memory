@@ -76,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-items", type=int, help="Maximum imported memories"
     )
     import_transcript_cmd.add_argument(
+        "--include-source-context",
+        action="store_true",
+        help="Retain bounded verbatim source excerpts beside extracted memories",
+    )
+    import_transcript_cmd.add_argument(
         "--json", action="store_true", help="Render JSON output"
     )
 
@@ -164,7 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
         "longmemeval-qa",
         help="Run LongMemEval retrieval, reader generation, and LLM judge",
     )
-    longmemeval_qa.add_argument("dataset", help="Path to LongMemEval JSON/JSONL dataset")
+    longmemeval_qa.add_argument(
+        "dataset", help="Path to LongMemEval JSON/JSONL dataset"
+    )
     longmemeval_qa.add_argument(
         "--cache",
         help="Extraction cache path (reuse the completed ingestion pass)",
@@ -192,7 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select this many questions from every LongMemEval category",
     )
     longmemeval_qa.add_argument(
-        "--retrieval-k", type=int, default=8, help="Number of memories passed to the reader"
+        "--retrieval-k",
+        type=int,
+        default=8,
+        help="Number of memories passed to the reader",
     )
     longmemeval_qa.add_argument(
         "--extractor",
@@ -292,7 +302,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     longmemeval_qa.add_argument("--timeout", type=float, default=180.0)
     longmemeval_qa.add_argument("--retries", type=int, default=1)
-    longmemeval_qa.add_argument("--json", action="store_true", help="Render JSON output")
+    longmemeval_qa.add_argument(
+        "--json", action="store_true", help="Render JSON output"
+    )
 
     mcp = subparsers.add_parser("mcp", help="Run the MCP stdio server")
     _add_store_options(mcp)
@@ -372,6 +384,7 @@ async def _run_transcript_import(args: argparse.Namespace) -> None:
         args.namespace,
         source=args.source,
         max_items=args.max_items,
+        include_source_context=args.include_source_context,
     )
     if args.json:
         print(
@@ -445,9 +458,8 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
     common_model = args.model
     extractor_model = args.extractor_model or common_model
     reader_model = args.reader_model or common_model
-    judge_model = (
-        args.judge_model
-        or ("typesafe/jev-1.13" if args.judge_provider == "openrouter-jev" else common_model)
+    judge_model = args.judge_model or (
+        "typesafe/jev-1.13" if args.judge_provider == "openrouter-jev" else common_model
     )
     if args.extractor == "lm-studio" and not extractor_model:
         raise SystemExit(
@@ -537,7 +549,9 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
             )
         )
         if args.stratified_per_category is not None
-        else set(args.question_ids) if args.question_ids else None
+        else set(args.question_ids)
+        if args.question_ids
+        else None
     )
     report = await run_longmemeval_qa(
         args.dataset,

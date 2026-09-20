@@ -14,9 +14,29 @@ SUPPORTED_PROJECT_EXTENSIONS = {".md", ".mdx", ".txt", ".rst"}
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _ROLE_PREFIX_RE = re.compile(r"^(?P<role>[A-Za-z][\w -]{0,20}):\s*(?P<content>.+)$")
 
-_DECISION_KEYWORDS = ("decide", "decided", "use ", "uses ", "must ", "should ", "policy", "standard", "convention", "require", "requires")
+_DECISION_KEYWORDS = (
+    "decide",
+    "decided",
+    "use ",
+    "uses ",
+    "must ",
+    "should ",
+    "policy",
+    "standard",
+    "convention",
+    "require",
+    "requires",
+)
 _PREFERENCE_KEYWORDS = ("prefer", "preferred", "avoid", "never ", "always ")
-_LEARNING_KEYWORDS = ("learned", "found", "issue", "bug", "fix", "because", "root cause")
+_LEARNING_KEYWORDS = (
+    "learned",
+    "found",
+    "issue",
+    "bug",
+    "fix",
+    "because",
+    "root cause",
+)
 _TODO_KEYWORDS = ("todo", "follow up", "next step", "next:", "need to", "needs to")
 
 
@@ -24,6 +44,15 @@ _TODO_KEYWORDS = ("todo", "follow up", "next step", "next:", "need to", "needs t
 class TranscriptMessage:
     role: str
     content: str
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSourceChunk:
+    """Bounded verbatim transcript evidence retained beside extracted memory."""
+
+    content: str
+    message_indices: tuple[int, ...]
+    roles: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -41,6 +70,7 @@ async def import_transcript(
     *,
     source: str | None = None,
     max_items: int | None = None,
+    include_source_context: bool = False,
 ) -> ImportPlan:
     """Import a transcript file into the memory store.
 
@@ -54,6 +84,7 @@ async def import_transcript(
         messages,
         namespace_id=namespace_id,
         source=source or str(path),
+        include_source_context=include_source_context,
     )
     if max_items is not None:
         requests = requests[:max_items]
@@ -149,6 +180,7 @@ def extract_transcript_requests(
     *,
     namespace_id: str,
     source: str,
+    include_source_context: bool = False,
 ) -> list[StoreMemoryRequest]:
     seen: set[str] = set()
     requests: list[StoreMemoryRequest] = []
@@ -184,7 +216,99 @@ def extract_transcript_requests(
                 )
             )
 
+    if include_source_context:
+        for chunk_index, chunk in enumerate(chunk_transcript_messages(messages)):
+            requests.append(
+                StoreMemoryRequest(
+                    namespace_id=namespace_id,
+                    content=chunk.content,
+                    title=f"Source transcript excerpt {chunk_index + 1}",
+                    memory_type=MemoryType.CONTEXT,
+                    scope=MemoryScope.PROJECT,
+                    source=source,
+                    tags=["imported", "transcript", "source-context"],
+                    provenance_key=source,
+                    memory_key=f"source.transcript.chunk.{chunk_index}",
+                    metadata={
+                        "source_context": True,
+                        "retrieval_role": "source_context",
+                        "source_message_indices": list(chunk.message_indices),
+                        "source_roles": list(chunk.roles),
+                        "import_source": source,
+                    },
+                    confidence=0.98,
+                )
+            )
+
     return requests
+
+
+def chunk_transcript_messages(
+    messages: list[TranscriptMessage],
+    *,
+    max_chars: int = 1600,
+    overlap_messages: int = 1,
+    overlap_chars: int = 240,
+) -> list[TranscriptSourceChunk]:
+    """Create compact source excerpts for hybrid fact-plus-source retrieval.
+
+    Extracted facts remain the primary index. These chunks are a bounded,
+    provenance-preserving fallback for exact names, visual attributes, code,
+    and assistant answers that lossy extraction may omit.
+    """
+
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    if overlap_messages < 0:
+        raise ValueError("overlap_messages cannot be negative")
+    if overlap_chars < 0:
+        raise ValueError("overlap_chars cannot be negative")
+    chunks: list[TranscriptSourceChunk] = []
+    current: list[tuple[int, TranscriptMessage, str]] = []
+    current_chars = 0
+
+    def char_count(items: list[tuple[int, TranscriptMessage, str]]) -> int:
+        return sum(len(item[2]) for item in items) + max(0, len(items) - 1)
+
+    def emit() -> None:
+        nonlocal current, current_chars
+        if not current:
+            return
+        chunks.append(
+            TranscriptSourceChunk(
+                content="\n".join(item[2] for item in current),
+                message_indices=tuple(item[0] for item in current),
+                roles=tuple(dict.fromkeys(item[1].role for item in current)),
+            )
+        )
+        current = current[-overlap_messages:] if overlap_messages else []
+        current_chars = char_count(current)
+
+    for message_index, message in enumerate(messages):
+        prefix = f"{message.role}: "
+        normalized = " ".join(message.content.split())
+        available = max(1, max_chars - len(prefix))
+        split_overlap = min(overlap_chars, max(0, available // 4))
+        split_step = max(1, available - split_overlap)
+        parts = [
+            normalized[start : start + available]
+            for start in range(0, len(normalized), split_step)
+        ] or [""]
+        for part in parts:
+            rendered = f"{prefix}{part}"
+            if current and current_chars + len(rendered) + 1 > max_chars:
+                emit()
+            # Overlap is best-effort. Never let retained context violate the
+            # public max_chars contract, especially for a split long message.
+            if current and current_chars + len(rendered) + 1 > max_chars:
+                current = []
+                current_chars = 0
+            current.append((message_index, message, rendered))
+            current_chars = char_count(current)
+            if current_chars >= max_chars:
+                emit()
+    emit()
+    return chunks
 
 
 def extract_project_requests(
@@ -273,7 +397,9 @@ def _collect_project_files(
     *,
     extensions: set[str] | None = None,
 ) -> list[Path]:
-    normalized_extensions = {ext.lower() for ext in (extensions or SUPPORTED_PROJECT_EXTENSIONS)}
+    normalized_extensions = {
+        ext.lower() for ext in (extensions or SUPPORTED_PROJECT_EXTENSIONS)
+    }
     if path.is_file():
         return [path]
     return sorted(

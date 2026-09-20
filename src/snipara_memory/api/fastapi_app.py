@@ -60,6 +60,10 @@ class RecallBody(BaseModel):
     include_provenance_context: bool = False
     provenance_context_limit: int | None = Field(default=None, ge=1, le=1000)
     provenance_context_group_limit: int | None = Field(default=None, ge=1, le=1000)
+    include_profile_context: bool = False
+    profile_context_limit: int | None = Field(default=None, ge=1, le=100)
+    include_source_context: bool = False
+    source_context_limit: int | None = Field(default=None, ge=1, le=100)
 
 
 def create_app(service: MemoryService) -> FastAPI:

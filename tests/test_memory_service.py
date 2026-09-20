@@ -8,10 +8,102 @@ from snipara_memory import (
     InMemoryMemoryStore,
     MemoryService,
     MemoryStatus,
+    MemoryType,
     RecallQuery,
     ResolveContradictionRequest,
     StoreMemoryRequest,
 )
+
+
+async def test_recall_can_include_durable_preference_profile() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+    await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The user prefers hotels with rooftop pools and skyline views.",
+            memory_type=MemoryType.PREFERENCE,
+        )
+    )
+    await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The deployment uses blue-green containers.",
+        )
+    )
+
+    matches = await service.semantic_recall(
+        RecallQuery(
+            namespace_id="demo",
+            query="Suggest somewhere to stay in Miami",
+            limit=2,
+            include_profile_context=True,
+            profile_context_limit=1,
+        )
+    )
+
+    assert any(match.memory.type is MemoryType.PREFERENCE for match in matches)
+
+
+async def test_source_context_requires_opt_in_or_matched_provenance() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+    await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The Plesiosaur has a blue scaly body and long flippers.",
+            provenance_key="session-dinosaur",
+            metadata={"source_context": True},
+        )
+    )
+    fact = await service.store_memory(
+        StoreMemoryRequest(
+            namespace_id="demo",
+            content="The user asked about a Plesiosaur illustration.",
+            provenance_key="session-dinosaur",
+        )
+    )
+
+    default_matches = await service.semantic_recall(
+        RecallQuery(namespace_id="demo", query="Plesiosaur body", limit=2)
+    )
+    assert [match.memory.id for match in default_matches] == [fact.id]
+
+    contextual_matches = await service.semantic_recall(
+        RecallQuery(
+            namespace_id="demo",
+            query="Plesiosaur body",
+            limit=2,
+            include_provenance_context=True,
+        )
+    )
+    assert len(contextual_matches) == 2
+    assert any(
+        match.memory.metadata.get("source_context") for match in contextual_matches
+    )
+
+
+async def test_direct_source_context_recall_is_bounded() -> None:
+    service = MemoryService(store=InMemoryMemoryStore())
+    for index in range(3):
+        await service.store_memory(
+            StoreMemoryRequest(
+                namespace_id="demo",
+                content=f"Plesiosaur source excerpt {index} about its blue body.",
+                metadata={"source_context": True},
+            )
+        )
+
+    matches = await service.semantic_recall(
+        RecallQuery(
+            namespace_id="demo",
+            query="Plesiosaur blue body",
+            limit=3,
+            include_source_context=True,
+            source_context_limit=1,
+        )
+    )
+
+    assert len(matches) == 1
+    assert matches[0].memory.metadata["source_context"] is True
 
 
 async def test_store_and_recall_memory() -> None:
@@ -51,7 +143,9 @@ async def test_detect_and_resolve_contradiction() -> None:
         )
     )
 
-    contradictions = await service.detect_contradictions("demo", similarity_threshold=0.4)
+    contradictions = await service.detect_contradictions(
+        "demo", similarity_threshold=0.4
+    )
     assert len(contradictions) == 1
 
     resolved = await service.resolve_contradiction(
@@ -120,7 +214,9 @@ async def test_explicit_memory_key_supersession_is_core_lifecycle_behavior() -> 
     assert buried.superseded_by_id == newer.id
 
 
-async def test_explicit_supersession_uses_observed_time_when_import_arrives_late() -> None:
+async def test_explicit_supersession_uses_observed_time_when_import_arrives_late() -> (
+    None
+):
     service = MemoryService(store=InMemoryMemoryStore())
 
     current = await service.store_memory(

@@ -229,6 +229,15 @@ class RecallQuery:
     # Bound how many provenance groups can contribute sibling context. This
     # prevents a broad candidate search from being flooded by weak groups.
     provenance_context_group_limit: int | None = None
+    # Reserve a small recall budget for durable user preferences even when a
+    # recommendation query names a new destination, product, or task.
+    include_profile_context: bool = False
+    profile_context_limit: int | None = None
+    # Source excerpts are normally opened through a matched provenance group,
+    # not allowed to flood direct semantic recall. Callers can opt into a
+    # small direct fallback budget for exact strings omitted by extraction.
+    include_source_context: bool = False
+    source_context_limit: int | None = None
 
 
 @dataclass(slots=True)

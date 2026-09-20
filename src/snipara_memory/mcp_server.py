@@ -58,8 +58,14 @@ def create_server(service: MemoryService) -> Server:
                         "namespace_id": {"type": "string"},
                         "content": {"type": "string"},
                         "title": {"type": "string"},
-                        "memory_type": {"type": "string", "enum": [item.value for item in MemoryType]},
-                        "scope": {"type": "string", "enum": [item.value for item in MemoryScope]},
+                        "memory_type": {
+                            "type": "string",
+                            "enum": [item.value for item in MemoryType],
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": [item.value for item in MemoryScope],
+                        },
                         "category": {"type": "string"},
                         "source": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
@@ -87,12 +93,28 @@ def create_server(service: MemoryService) -> Server:
                         "tiers": {"type": "array", "items": {"type": "string"}},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "candidate_limit": {"type": "integer", "default": 10},
-                        "diversify_by_provenance": {"type": "boolean", "default": False},
+                        "diversify_by_provenance": {
+                            "type": "boolean",
+                            "default": False,
+                        },
                         "max_per_provenance": {"type": "integer"},
                         "deduplicate_evidence": {"type": "boolean", "default": False},
-                        "include_provenance_context": {"type": "boolean", "default": False},
+                        "include_provenance_context": {
+                            "type": "boolean",
+                            "default": False,
+                        },
                         "provenance_context_limit": {"type": "integer"},
                         "provenance_context_group_limit": {"type": "integer"},
+                        "include_profile_context": {
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "profile_context_limit": {"type": "integer"},
+                        "include_source_context": {
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "source_context_limit": {"type": "integer"},
                     },
                     "required": ["namespace_id", "query"],
                 },
@@ -167,6 +189,10 @@ def create_server(service: MemoryService) -> Server:
                         "path": {"type": "string"},
                         "source": {"type": "string"},
                         "max_items": {"type": "integer"},
+                        "include_source_context": {
+                            "type": "boolean",
+                            "default": False,
+                        },
                     },
                     "required": ["namespace_id", "path"],
                 },
@@ -194,8 +220,12 @@ def create_server(service: MemoryService) -> Server:
                     namespace_id=arguments["namespace_id"],
                     content=arguments["content"],
                     title=arguments.get("title"),
-                    memory_type=MemoryType(arguments.get("memory_type", MemoryType.FACT.value)),
-                    scope=MemoryScope(arguments.get("scope", MemoryScope.PROJECT.value)),
+                    memory_type=MemoryType(
+                        arguments.get("memory_type", MemoryType.FACT.value)
+                    ),
+                    scope=MemoryScope(
+                        arguments.get("scope", MemoryScope.PROJECT.value)
+                    ),
                     category=arguments.get("category"),
                     source=arguments.get("source"),
                     tags=list(arguments.get("tags", [])),
@@ -252,6 +282,22 @@ def create_server(service: MemoryService) -> Server:
                         if arguments.get("provenance_context_group_limit") is not None
                         else None
                     ),
+                    include_profile_context=bool(
+                        arguments.get("include_profile_context", False)
+                    ),
+                    profile_context_limit=(
+                        int(arguments["profile_context_limit"])
+                        if arguments.get("profile_context_limit") is not None
+                        else None
+                    ),
+                    include_source_context=bool(
+                        arguments.get("include_source_context", False)
+                    ),
+                    source_context_limit=(
+                        int(arguments["source_context_limit"])
+                        if arguments.get("source_context_limit") is not None
+                        else None
+                    ),
                 )
             )
             return [_json_result([asdict(match) for match in matches])]
@@ -268,9 +314,14 @@ def create_server(service: MemoryService) -> Server:
         if name == "memory_list":
             memories = await service.list_memories(
                 arguments["namespace_id"],
-                statuses=[MemoryStatus(value) for value in arguments.get("statuses", [])] or None,
-                tiers=[MemoryTier(value) for value in arguments.get("tiers", [])] or None,
-                types=[MemoryType(value) for value in arguments.get("types", [])] or None,
+                statuses=[
+                    MemoryStatus(value) for value in arguments.get("statuses", [])
+                ]
+                or None,
+                tiers=[MemoryTier(value) for value in arguments.get("tiers", [])]
+                or None,
+                types=[MemoryType(value) for value in arguments.get("types", [])]
+                or None,
                 limit=arguments.get("limit"),
             )
             return [_json_result([asdict(memory) for memory in memories])]
@@ -302,6 +353,9 @@ def create_server(service: MemoryService) -> Server:
                 arguments["namespace_id"],
                 source=arguments.get("source"),
                 max_items=arguments.get("max_items"),
+                include_source_context=bool(
+                    arguments.get("include_source_context", False)
+                ),
             )
             return [_json_result(asdict(result))]
 
@@ -319,7 +373,9 @@ def create_server(service: MemoryService) -> Server:
     return server
 
 
-async def run_stdio_server(*, store_path: str | None = None, in_memory: bool = False) -> None:
+async def run_stdio_server(
+    *, store_path: str | None = None, in_memory: bool = False
+) -> None:
     """Run the snipara-memory MCP server over stdio.
 
     This is the entry point for CLI usage via `snipara-memory mcp`. It initializes
@@ -341,7 +397,9 @@ async def run_stdio_server(*, store_path: str | None = None, in_memory: bool = F
 def _json_result(payload: Any) -> TextContent:
     return TextContent(
         type="text",
-        text=json.dumps(_jsonable(payload), indent=2, ensure_ascii=True, sort_keys=False),
+        text=json.dumps(
+            _jsonable(payload), indent=2, ensure_ascii=True, sort_keys=False
+        ),
     )
 
 

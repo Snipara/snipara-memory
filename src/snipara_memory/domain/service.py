@@ -121,10 +121,7 @@ def select_diverse_matches(
             group = grouped[group_key]
             if round_index >= len(group):
                 continue
-            if (
-                max_per_provenance is not None
-                and round_index >= max_per_provenance
-            ):
+            if max_per_provenance is not None and round_index >= max_per_provenance:
                 continue
             selected.append(group[round_index])
             made_progress = True
@@ -214,8 +211,12 @@ class MemoryService:
         memories = [self._build_memory(request) for request in requests]
         embeddings = [request.embedding for request in requests]
 
-        if self._embeddings is not None and any(embedding is None for embedding in embeddings):
-            generated = await self._embeddings.embed_batch([request.content for request in requests])
+        if self._embeddings is not None and any(
+            embedding is None for embedding in embeddings
+        ):
+            generated = await self._embeddings.embed_batch(
+                [request.content for request in requests]
+            )
             embeddings = [
                 explicit if explicit is not None else generated[index]
                 for index, explicit in enumerate(embeddings)
@@ -250,17 +251,20 @@ class MemoryService:
             raise ValueError(
                 "RecallQuery.provenance_context_group_limit must be positive"
             )
+        if query.profile_context_limit is not None and query.profile_context_limit <= 0:
+            raise ValueError("RecallQuery.profile_context_limit must be positive")
+        if query.source_context_limit is not None and query.source_context_limit <= 0:
+            raise ValueError("RecallQuery.source_context_limit must be positive")
 
         query_embedding_text = query.query
         if self._embeddings is not None:
             query_embedding = await self._embeddings.embed_text(query_embedding_text)
 
         candidate_limit = query.candidate_limit
-        if candidate_limit is None and (
-            query.diversify_by_provenance
-            or query.deduplicate_evidence
-            or query.include_provenance_context
-        ):
+        if candidate_limit is None:
+            # Hybrid stores may contain source excerpts that are intentionally
+            # excluded from direct recall. Over-fetch so those excerpts cannot
+            # consume the store's candidate window and hide compact facts.
             candidate_limit = max(query.limit * 4, query.limit)
         search_query = replace(
             query,
@@ -273,7 +277,15 @@ class MemoryService:
         eligible: list[RecallMatch] = []
         matched_provenance_scores: dict[str, float] = {}
 
+        direct_source_count = 0
         for match in matches:
+            is_source_context = bool(match.memory.metadata.get("source_context"))
+            if is_source_context:
+                if not query.include_source_context:
+                    continue
+                if direct_source_count >= (query.source_context_limit or 4):
+                    continue
+                direct_source_count += 1
             decayed_confidence = calculate_confidence_decay(
                 match.memory.confidence,
                 created_at=match.memory.created_at,
@@ -357,21 +369,62 @@ class MemoryService:
                 )
                 context_counts[provenance] += 1
 
+        if query.include_profile_context:
+            existing_ids = {match.memory.id for match in eligible}
+            active_memories = await self._store.list_memories(
+                query.namespace_id,
+                statuses=[MemoryStatus.ACTIVE],
+            )
+            profile_memories = [
+                memory
+                for memory in active_memories
+                if memory.type is MemoryType.PREFERENCE
+                or memory.metadata.get("evidence_kind") == "preference"
+            ]
+            profile_memories.sort(
+                key=lambda memory: (
+                    memory.confidence,
+                    memory.relevance_boost,
+                    self._observation_sort_key(memory),
+                ),
+                reverse=True,
+            )
+            for memory in profile_memories[: query.profile_context_limit or 8]:
+                if memory.id in existing_ids:
+                    continue
+                eligible.append(
+                    RecallMatch(
+                        memory=memory,
+                        score=0.25,
+                        reason="profile-context",
+                    )
+                )
+                existing_ids.add(memory.id)
+
         eligible.sort(
             key=lambda match: (
                 match.score,
                 match.memory.confidence,
                 match.memory.relevance_boost,
                 self._observation_sort_key(match.memory),
-                match.memory.last_accessed_at
-                or datetime.min.replace(tzinfo=UTC),
+                match.memory.last_accessed_at or datetime.min.replace(tzinfo=UTC),
             ),
             reverse=True,
         )
 
+        reserved_profile: list[RecallMatch] = []
+        if query.include_profile_context:
+            profile_limit = min(query.profile_context_limit or 8, query.limit)
+            reserved_profile = [
+                match
+                for match in eligible
+                if match.memory.type is MemoryType.PREFERENCE
+                or match.memory.metadata.get("evidence_kind") == "preference"
+            ][:profile_limit]
+        reserved_ids = {match.memory.id for match in reserved_profile}
         selected = select_diverse_matches(
-            eligible,
-            limit=query.limit,
+            [match for match in eligible if match.memory.id not in reserved_ids],
+            limit=query.limit - len(reserved_profile),
             max_per_provenance=(
                 (query.max_per_provenance or 1)
                 if query.diversify_by_provenance
@@ -379,6 +432,9 @@ class MemoryService:
             ),
             deduplicate_evidence=query.deduplicate_evidence,
         )
+        selected.extend(reserved_profile)
+        rank = {match.memory.id: index for index, match in enumerate(eligible)}
+        selected.sort(key=lambda match: rank[match.memory.id])
         now = datetime.now(UTC)
         touched_matches: list[RecallMatch] = []
         for match in selected:
@@ -429,8 +485,7 @@ class MemoryService:
         Cache TTL and per-tier budgets are configurable.
         """
         cache_key = (
-            f"session:{namespace_id}:"
-            f"{critical_limit}:{daily_limit}:{archive_limit}"
+            f"session:{namespace_id}:{critical_limit}:{daily_limit}:{archive_limit}"
         )
         cached = await self._get_cached_bundle(cache_key)
         if cached is not None:
@@ -610,7 +665,9 @@ class MemoryService:
         loser_id: str | None = None
 
         if request.resolution is ContradictionResolution.MERGE:
-            merged_content = request.merged_content or self._merge_content(memory_a, memory_b)
+            merged_content = request.merged_content or self._merge_content(
+                memory_a, memory_b
+            )
             merged_memory = await self.store_memory(
                 StoreMemoryRequest(
                     namespace_id=memory_a.namespace_id,
@@ -754,8 +811,7 @@ class MemoryService:
         """
 
         if not any(
-            memory.memory_key or memory.supersedes_memory_key
-            for memory in created
+            memory.memory_key or memory.supersedes_memory_key for memory in created
         ):
             return ()
 
@@ -766,9 +822,7 @@ class MemoryService:
                 statuses=[MemoryStatus.ACTIVE],
             )
             current_by_key = {
-                memory.memory_key: memory
-                for memory in active
-                if memory.memory_key
+                memory.memory_key: memory for memory in active if memory.memory_key
             }
             for memory in (
                 item for item in created if item.namespace_id == namespace_id
@@ -777,9 +831,9 @@ class MemoryService:
                 if supersedes_key:
                     previous = current_by_key.get(supersedes_key)
                     if previous is not None and previous.id != memory.id:
-                        if self._observation_sort_key(memory) >= self._observation_sort_key(
-                            previous
-                        ):
+                        if self._observation_sort_key(
+                            memory
+                        ) >= self._observation_sort_key(previous):
                             await self.move_to_graveyard(
                                 previous.id,
                                 reason=GraveyardReason.SUPERSEDED,
@@ -810,9 +864,9 @@ class MemoryService:
                         current_by_key[supersedes_key] = memory
                 if memory.memory_key:
                     current = current_by_key.get(memory.memory_key)
-                    if current is None or self._observation_sort_key(memory) >= self._observation_sort_key(
-                        current
-                    ):
+                    if current is None or self._observation_sort_key(
+                        memory
+                    ) >= self._observation_sort_key(current):
                         current_by_key[memory.memory_key] = memory
         return tuple(superseded_ids)
 
@@ -927,7 +981,9 @@ class MemoryService:
 
         if request.resolution is ContradictionResolution.MANUAL:
             if request.winner_memory_id not in {memory_a.id, memory_b.id}:
-                raise ValueError("Manual contradiction resolution requires a valid winner_memory_id")
+                raise ValueError(
+                    "Manual contradiction resolution requires a valid winner_memory_id"
+                )
             if request.winner_memory_id == memory_a.id:
                 return memory_a, memory_b
             return memory_b, memory_a

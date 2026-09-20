@@ -41,13 +41,18 @@ from snipara_memory.qa import (
     _apply_acquisition_count_guard,
     _apply_action_count_guard,
     _apply_currency_total_guard,
+    _apply_preference_projection_guard,
+    _apply_named_list_entity_guard,
     _apply_temporal_relation_guard,
     _action_item_checklist,
     _apply_update_resolution_guard,
+    _bounded_reader_evidence,
+    _compact_resolution_audit,
     _contribution_count_from_map,
     _deterministic_resolution_audit,
     _expanded_retrieval_terms,
     _named_event_mentions,
+    _project_identity,
     _parse_judge_label,
     _parse_reader_answer,
     _question_answerability_score,
@@ -56,6 +61,8 @@ from snipara_memory.qa import (
     _reader_evidence_cards,
     _retrieval_terms,
     _should_map_reduce_count,
+    _source_lexical_specificity,
+    _temporal_event_phrases,
 )
 
 
@@ -206,15 +213,22 @@ async def test_ingestion_graveyards_superseded_facts_and_keeps_provenance(
     active = await service.list_memories(
         result.namespace_id, statuses=[MemoryStatus.ACTIVE]
     )
-    old_memory = await store.get_memory(result.stored_memory_ids[0])
-    new_memory = await store.get_memory(result.stored_memory_ids[1])
+    all_memories = await service.list_memories(result.namespace_id)
+    city_memories = [
+        memory for memory in all_memories if memory.memory_key == "user-city"
+    ]
+    old_memory = next(
+        memory for memory in city_memories if memory.status is MemoryStatus.GRAVEYARD
+    )
+    new_memory = next(
+        memory for memory in city_memories if memory.status is MemoryStatus.ACTIVE
+    )
 
-    assert len(active) == 1
-    assert active[0].content == "The user now lives in Zurich."
-    assert old_memory is not None
+    assert [
+        memory.content for memory in active if not memory.metadata.get("source_context")
+    ] == ["The user now lives in Zurich."]
     assert old_memory.status is MemoryStatus.GRAVEYARD
     assert old_memory.memory_key == "user-city"
-    assert new_memory is not None
     assert new_memory.memory_key == "user-city"
     assert new_memory.supersedes_memory_key == "user-city"
     assert new_memory.provenance_key == "session-2"
@@ -222,7 +236,7 @@ async def test_ingestion_graveyards_superseded_facts_and_keeps_provenance(
     assert new_memory.observed_at.isoformat() == "2024-05-01T00:00:00+00:00"
     assert new_memory.metadata["source_session_id"] == "session-2"
     assert "answer-session" in new_memory.tags
-    assert result.superseded_memory_ids == (result.stored_memory_ids[0],)
+    assert result.superseded_memory_ids == (old_memory.id,)
 
 
 async def test_ingestion_handles_repeated_supersession_without_crashing(
@@ -246,15 +260,19 @@ async def test_ingestion_handles_repeated_supersession_without_crashing(
     )
 
     result = report.questions[0]
-    assert result.superseded_memory_ids == (
-        result.stored_memory_ids[0],
-        result.stored_memory_ids[1],
-    )
+    all_memories = await store.list_memories("longmemeval:q-1")
+    superseded_city_ids = {
+        memory.id
+        for memory in all_memories
+        if memory.memory_key == "user-city" and memory.status is MemoryStatus.GRAVEYARD
+    }
+    assert set(result.superseded_memory_ids) == superseded_city_ids
     active = await store.list_memories(
         "longmemeval:q-1", statuses=[MemoryStatus.ACTIVE]
     )
-    assert len(active) == 1
-    assert active[0].content == "The user now lives in Zurich."
+    assert [
+        memory.content for memory in active if not memory.metadata.get("source_context")
+    ] == ["The user now lives in Zurich."]
 
 
 async def test_ingestion_keeps_cumulative_todo_evidence_active(
@@ -295,7 +313,11 @@ async def test_ingestion_keeps_cumulative_todo_evidence_active(
     active = await service.list_memories(
         result.namespace_id, statuses=[MemoryStatus.ACTIVE]
     )
-    assert {memory.metadata["fact_key"] for memory in active} == {
+    assert {
+        memory.metadata["fact_key"]
+        for memory in active
+        if not memory.metadata.get("source_context")
+    } == {
         "boots.return",
         "boots.pickup",
     }
@@ -476,10 +498,10 @@ async def test_lm_studio_extractor_uses_structured_output_without_ground_truth()
         assert payload["model"] == "local-test-model"
         assert payload["response_format"]["type"] == "json_schema"
         assert (
-            payload["response_format"]["json_schema"]["schema"]["properties"][
-                "facts"
-                ]["maxItems"]
-                == 12
+            payload["response_format"]["json_schema"]["schema"]["properties"]["facts"][
+                "maxItems"
+            ]
+            == 12
         )
         assert payload["reasoning_effort"] == "low"
         assert "Extraction priority is important" in payload["messages"][0]["content"]
@@ -781,9 +803,10 @@ def test_lm_studio_batch_payload_requires_every_session_result() -> None:
 
     assert schema["properties"]["sessions"]["minItems"] == 3
     assert schema["properties"]["sessions"]["maxItems"] == 3
-    assert schema["properties"]["sessions"]["items"]["properties"]["facts"][
-        "maxItems"
-        ] == 12
+    assert (
+        schema["properties"]["sessions"]["items"]["properties"]["facts"]["maxItems"]
+        == 12
+    )
 
 
 async def test_lm_studio_batch_extractor_coalesces_requests() -> None:
@@ -853,7 +876,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v41" in reader.version
+    assert ":lmstudio-longmemeval-reader-v49" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
     assert "niece" in READER_SYSTEM_PROMPT
@@ -933,6 +956,26 @@ def test_action_item_checklist_excludes_personal_returns_without_store() -> None
     ]
 
 
+def test_action_item_checklist_rejects_colors_and_address_substrings() -> None:
+    checklist = _action_item_checklist(
+        "How many items of clothing do I need to pick up or return from a store?",
+        [
+            {
+                "source_session_id": "family",
+                "title": "Green sweater return",
+                "content": "My sister will return my green sweater next week.",
+            },
+            {
+                "source_session_id": "commerce",
+                "title": "Returns process details",
+                "content": "The return address and refund method are not finalized.",
+            },
+        ],
+    )
+
+    assert checklist == []
+
+
 def test_action_item_checklist_models_both_sides_of_explicit_exchange() -> None:
     checklist = _action_item_checklist(
         "How many items of clothing do I need to pick up or return from a store?",
@@ -952,6 +995,27 @@ def test_action_item_checklist_models_both_sides_of_explicit_exchange() -> None:
         ("pickup", "boots", "zara"),
     }
     assert _apply_action_count_guard("2", checklist) == "2"
+
+
+def test_action_item_checklist_merges_named_and_generic_venue_aliases() -> None:
+    checklist = _action_item_checklist(
+        "How many items of clothing do I need to pick up or return from a store?",
+        [
+            {
+                "source_session_id": "exchange",
+                "content": "Return boots to Zara and pick up the new pair.",
+            },
+            {
+                "source_session_id": "exchange",
+                "content": "Return the boots to the store and pick up the boots.",
+            },
+        ],
+    )
+
+    assert {(row["action"], row["item"], row["venue"]) for row in checklist} == {
+        ("return", "boots", "zara"),
+        ("pickup", "boots", "zara"),
+    }
 
 
 def test_multi_session_count_uses_contribution_ledger_not_latest_quantity() -> None:
@@ -1001,12 +1065,11 @@ def test_retrieval_concepts_bridge_entities_and_answer_attributes() -> None:
 
 def test_reader_answer_parser_keeps_only_structured_final_answer() -> None:
     assert _parse_reader_answer('{"answer":"$185"}') == "$185"
-    assert _parse_reader_answer(
-        "I first estimated $165.\nFinal answer: $185"
-    ) == "$185"
-    assert _parse_reader_answer(
-        'The evidence combines two sessions.\n{"answer":"2 AM"}'
-    ) == "2 AM"
+    assert _parse_reader_answer("I first estimated $165.\nFinal answer: $185") == "$185"
+    assert (
+        _parse_reader_answer('The evidence combines two sessions.\n{"answer":"2 AM"}')
+        == "2 AM"
+    )
 
 
 def test_structured_contribution_map_has_deterministic_count() -> None:
@@ -1099,9 +1162,7 @@ def test_multi_session_temporal_relation_keeps_relative_event_chain() -> None:
     )
 
     assert audit["kind"] == "multi_session_temporal_relation"
-    assert ["2 AM"] in [
-        row["scalar_values"] for row in audit["contribution_ledger"]
-    ]
+    assert ["2 AM"] in [row["scalar_values"] for row in audit["contribution_ledger"]]
     assert (
         _apply_temporal_relation_guard(
             "What time did I go to bed on the day before my appointment?",
@@ -1134,6 +1195,53 @@ def test_preference_resolution_audit_preserves_temporal_qualifiers() -> None:
     assert audit["preference_evidence"][0]["source_turn_indices"] == []
 
 
+def test_preference_guard_projects_constraints_when_reader_abstains() -> None:
+    audit = {
+        "kind": "preference",
+        "preference_evidence": [
+            {
+                "content": (
+                    "User prefers hotels with great city views, rooftop pools, "
+                    "and hot tubs on balconies."
+                )
+            }
+        ],
+    }
+
+    answer = _apply_preference_projection_guard(
+        "Can you suggest a hotel for my upcoming trip to Miami?",
+        "I don't have any information about hotels in Miami.",
+        audit,
+    )
+
+    assert answer == (
+        "Look for a hotel with great city views, rooftop pools, and hot tubs "
+        "on balconies in Miami."
+    )
+
+
+def test_named_list_entity_guard_recovers_exact_name_from_source() -> None:
+    answer = _apply_named_list_entity_guard(
+        "Remind me of the unique dessert shop with giant milkshakes.",
+        "I don't have that information.",
+        [
+            {
+                "evidence_kind": "source_context",
+                "content": (
+                    "1. The Sugar Factory - A sweet shop with specialty drinks "
+                    "and giant milkshakes. 2. Wondermade - Gourmet marshmallows."
+                ),
+            }
+        ],
+    )
+
+    assert answer == "The Sugar Factory"
+
+
+def test_reader_parser_preserves_empty_structured_answer_for_fallbacks() -> None:
+    assert _parse_reader_answer('{"answer":""}') == ""
+
+
 def test_high_signal_augmentation_preserves_later_user_updates() -> None:
     session = LongMemEvalSession(
         session_id="answer-1",
@@ -1149,11 +1257,125 @@ def test_high_signal_augmentation_preserves_later_user_updates() -> None:
 
     facts = _augment_high_signal_evidence(session, [])
 
-    assert [fact.content for fact in facts] == [
+    assert [fact.content for fact in facts[:2]] == [
         "She moved to Chicago.",
         "Rachel just moved back to the suburbs again.",
     ]
-    assert all(fact.metadata["explicit_user_evidence"] for fact in facts)
+    assert facts[2].metadata["source_context"] is True
+
+
+def test_source_context_preserves_exact_assistant_visual_attribute() -> None:
+    session = LongMemEvalSession(
+        session_id="dinosaurs",
+        date="2024-01-01",
+        turns=(
+            LongMemEvalTurn(
+                role="assistant",
+                content="The Plesiosaur has a blue scaly body and long flippers.",
+            ),
+        ),
+    )
+
+    facts = _augment_high_signal_evidence(session, [])
+
+    assert any(
+        fact.metadata.get("source_context") and "blue scaly body" in fact.content
+        for fact in facts
+    )
+    source_fact = next(fact for fact in facts if fact.metadata.get("source_context"))
+    assert source_fact.metadata["explicit_user_evidence"] is False
+
+
+def test_source_specificity_prefers_rare_exact_attributes() -> None:
+    exact = SimpleNamespace(
+        title="Source excerpt",
+        content="The Sugar Factory at Icon Park serves giant milkshakes.",
+        tags=("source-context",),
+        memory_key="source.1",
+        metadata={"source_context": True},
+    )
+    generic = SimpleNamespace(
+        title="Source excerpt",
+        content="The store has many items to return and several dessert options.",
+        tags=("source-context",),
+        memory_key="source.2",
+        metadata={"source_context": True},
+    )
+    query_terms = _retrieval_terms(
+        "Remind me of the unique dessert shop with giant milkshakes in Orlando"
+    )
+    frequency = {
+        term: (1 if term in {"giant", "milkshake"} else 20) for term in query_terms
+    }
+
+    exact_score = _source_lexical_specificity(
+        exact,
+        query_term_sets=[query_terms],
+        document_frequency=frequency,
+        document_count=100,
+    )
+    generic_score = _source_lexical_specificity(
+        generic,
+        query_term_sets=[query_terms],
+        document_frequency=frequency,
+        document_count=100,
+    )
+
+    assert exact_score > generic_score
+
+
+def test_reader_evidence_window_centers_exact_attribute() -> None:
+    prefix = "introductory dinosaur material " * 40
+    text = f"{prefix}The Plesiosaur has a blue scaly body and long flippers."
+
+    excerpt = _bounded_reader_evidence(
+        text,
+        question="What color was the scaly body of the Plesiosaur?",
+        max_chars=180,
+    )
+
+    assert "Plesiosaur has a blue scaly body" in excerpt
+    assert len(excerpt) <= 182
+
+
+def test_reader_evidence_window_prefers_concrete_repeated_mention() -> None:
+    text = (
+        "Plesiosaur overview. "
+        + ("general museum exhibit context " * 35)
+        + "The Plesiosaur has a blue scaly body and long flippers."
+    )
+
+    excerpt = _bounded_reader_evidence(
+        text,
+        question="What color was the scaly body of the Plesiosaur?",
+        max_chars=180,
+    )
+
+    assert "Plesiosaur has a blue scaly body" in excerpt
+
+
+def test_resolution_audit_is_compact_and_keeps_entity_keys() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "instructions": ["inspect rows"],
+        "contribution_ledger": [
+            {
+                "source_session_id": f"session-{index}",
+                "entity_key": f"project:{index}",
+                "content": "x" * 1000,
+                "directness_score": 6,
+            }
+            for index in range(20)
+        ],
+        "session_contribution_maps": [{"large": "payload" * 1000}],
+    }
+
+    compact = _compact_resolution_audit(audit)
+
+    assert len(compact["contribution_ledger"]) == 8
+    assert compact["contribution_ledger"][0]["entity_key"] == "project:0"
+    assert len(compact["contribution_ledger"][0]["content"]) <= 100
+    assert "session_contribution_maps" not in compact
 
 
 def test_high_signal_augmentation_preserves_quantified_user_evidence() -> None:
@@ -1174,9 +1396,7 @@ def test_high_signal_augmentation_preserves_quantified_user_evidence() -> None:
 
     facts = _augment_high_signal_evidence(session, [])
     quantitative = [
-        fact
-        for fact in facts
-        if fact.metadata.get("explicit_quantitative_evidence")
+        fact for fact in facts if fact.metadata.get("explicit_quantitative_evidence")
     ]
 
     assert [fact.metadata["quantitative_values"] for fact in quantitative] == [
@@ -1212,9 +1432,7 @@ def test_resolution_audit_prefers_latest_update_without_gold_fields() -> None:
     )
 
     assert audit["kind"] == "knowledge_update"
-    assert audit["latest_update_evidence"][0]["content"].endswith(
-        "suburbs again."
-    )
+    assert audit["latest_update_evidence"][0]["content"].endswith("suburbs again.")
 
 
 def test_resolution_audit_computes_temporal_interval_from_evidence_dates() -> None:
@@ -1244,6 +1462,60 @@ def test_resolution_audit_computes_temporal_interval_from_evidence_dates() -> No
     }
 
 
+def test_temporal_resolution_computes_interval_between_two_events() -> None:
+    question = (
+        "How many days passed between the day I played my old keyboard "
+        "and the day I discovered a bluegrass band?"
+    )
+    context = [
+        {
+            "rank": 1,
+            "question_type": "temporal-reasoning",
+            "source_session_id": "keyboard",
+            "session_date": "2023/03/25",
+            "title": "Old keyboard",
+            "content": "I played my favorite songs on my old keyboard.",
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+        },
+        {
+            "rank": 2,
+            "question_type": "temporal-reasoning",
+            "source_session_id": "bluegrass",
+            "session_date": "2023/03/31",
+            "title": "Bluegrass discovery",
+            "content": "I discovered a bluegrass band with a banjo player.",
+            "evidence_kind": "user_fact",
+            "explicit_user_evidence": True,
+        },
+    ]
+
+    assert _temporal_event_phrases(question) == [
+        "I played my old keyboard",
+        "I discovered a bluegrass band",
+    ]
+    assert _deterministic_resolution_audit(question, context)["computed_interval"] == {
+        "unit": "days",
+        "value": 6,
+        "start_date": "2023-03-25",
+        "end_date": "2023-03-31",
+    }
+
+
+def test_project_identity_merges_extracted_and_source_paraphrases() -> None:
+    extracted = {
+        "title": "Marketing Research project",
+        "content": "User led the data analysis team for a Marketing Research class project.",
+    }
+    source = {
+        "title": "Source excerpt",
+        "content": "I led the data analysis team in my Marketing Research class project.",
+    }
+
+    assert _project_identity(extracted) == "project:marketing research"
+    assert _project_identity(source) == _project_identity(extracted)
+
+
 def test_update_resolution_guard_rejects_conflicting_scalar() -> None:
     audit = {
         "kind": "knowledge_update",
@@ -1254,9 +1526,7 @@ def test_update_resolution_guard_rejects_conflicting_scalar() -> None:
         },
     }
 
-    guarded = _apply_update_resolution_guard(
-        "The amount was $350,000.", audit
-    )
+    guarded = _apply_update_resolution_guard("The amount was $350,000.", audit)
 
     assert "$400,000" in guarded
     assert _apply_update_resolution_guard("The amount was $400,000.", audit) == (
@@ -1419,11 +1689,14 @@ async def test_qa_pipeline_retrieves_reads_judges_and_replays_cache(
     assert replay.judge_cache_hits == 1
     assert replay_reader.calls == 0
     assert replay_judge.calls == 0
-    assert LongMemEvalQACache(qa_cache).get_reader(
-        "q-1",
-        input_hash="wrong",
-        reader_version="fake-reader-v1",
-    ) is None
+    assert (
+        LongMemEvalQACache(qa_cache).get_reader(
+            "q-1",
+            input_hash="wrong",
+            reader_version="fake-reader-v1",
+        )
+        is None
+    )
 
 
 async def test_qa_marks_judged_results_with_partial_ingestion(tmp_path: Path) -> None:
@@ -1486,9 +1759,7 @@ async def test_reader_payload_preserves_turn_provenance_and_session_bundle() -> 
     match = SimpleNamespace(memory=memory, score=1.0)
     captured: dict[str, Any] = {}
 
-    with _json_server(
-        {"choices": [{"message": {"content": "Zurich"}}]}
-    ) as server:
+    with _json_server({"choices": [{"message": {"content": "Zurich"}}]}) as server:
         reader = LmStudioLongMemEvalReader(
             model="reader-model",
             base_url=f"http://127.0.0.1:{server.server_port}/v1",
@@ -1503,6 +1774,47 @@ async def test_reader_payload_preserves_turn_provenance_and_session_bundle() -> 
     assert captured["session_groups"][0]["user_evidence_ranks"] == [1]
     assert captured["deterministic_resolution_audit"]["kind"] == "multi_session"
     assert captured["deterministic_resolution_audit"]["distinct_session_count"] == 1
+
+
+async def test_reader_payload_stays_bounded_without_duplicate_session_titles() -> None:
+    matches = []
+    for index in range(12):
+        memory = SimpleNamespace(
+            title=f"Evidence {index} " + ("title " * 80),
+            content=("context material " * 150)
+            + f"The Plesiosaur has a blue scaly body in session {index}.",
+            type=MemoryType.FACT,
+            metadata={
+                "source_session_date": f"2024-05-{index + 1:02d}",
+                "source_session_id": f"session-{index}",
+                "source_turn_indices": list(range(40)),
+                "question_type": "single-session-user",
+                "fact_key": "fact." + ("long-key-" * 40),
+                "evidence_kind": "user_fact",
+                "explicit_user_evidence": True,
+                "quantitative_values": ["1234567890" * 10] * 20,
+                "temporal_anchor": "anchor " * 100,
+            },
+            memory_key="fact." + ("long-key-" * 40),
+            supersedes_memory_key="previous." + ("long-key-" * 40),
+            observed_at=None,
+        )
+        matches.append(SimpleNamespace(memory=memory, score=1.0))
+
+    with _json_server({"choices": [{"message": {"content": "blue"}}]}) as server:
+        reader = LmStudioLongMemEvalReader(
+            model="reader-model",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            retries=0,
+        )
+        await reader.answer("What color was the scaly body of the Plesiosaur?", matches)
+        raw_payload = server.requests[0]["messages"][1]["content"]
+        captured = json.loads(raw_payload)
+
+    assert len(raw_payload) < 15_000
+    assert len(captured["evidence_cards"]) <= 4
+    assert all("memory_titles" not in group for group in captured["session_groups"])
+    assert all(len(memory["title"]) <= 120 for memory in captured["retrieved_memories"])
 
 
 def test_temporal_resolution_keeps_companion_qualifier() -> None:

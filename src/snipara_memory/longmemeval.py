@@ -30,7 +30,11 @@ from .domain import (
     MemoryType,
     StoreMemoryRequest,
 )
-from .importers import TranscriptMessage, extract_transcript_requests
+from .importers import (
+    TranscriptMessage,
+    chunk_transcript_messages,
+    extract_transcript_requests,
+)
 
 LONGMEMEVAL_CACHE_SCHEMA = "snipara.longmemeval.extraction-cache.v1"
 LONGMEMEVAL_SOURCE = "longmemeval-cleaned"
@@ -466,9 +470,7 @@ def _structured_schedule_facts(
             facts.append(
                 ExtractedFact(
                     content=_compact_evidence_text(
-                        f"Shift rotation for {day}: "
-                        + "; ".join(assignments)
-                        + "."
+                        f"Shift rotation for {day}: " + "; ".join(assignments) + "."
                     ),
                     title=f"Shift rotation {day}",
                     memory_type=MemoryType.FACT,
@@ -506,7 +508,9 @@ def _explicit_museum_visit_facts(
             if "museum of modern art" in lowered or "moma" in lowered
             else "museum"
         )
-        fact_key = "user.visit.museum_of_modern_art" if museum_name != "museum" else None
+        fact_key = (
+            "user.visit.museum_of_modern_art" if museum_name != "museum" else None
+        )
         facts.append(
             ExtractedFact(
                 content=_compact_evidence_text(turn.content),
@@ -586,10 +590,7 @@ def _explicit_user_signal_facts(
 
     if max_additions <= 0:
         return []
-    existing_text = {
-        " ".join(fact.content.lower().split())
-        for fact in existing_facts
-    }
+    existing_text = {" ".join(fact.content.lower().split()) for fact in existing_facts}
     additions: list[ExtractedFact] = []
     for turn_index, turn in enumerate(session.turns):
         if turn.role != "user":
@@ -609,7 +610,10 @@ def _explicit_user_signal_facts(
             continue
         if len(normalized) < 12:
             continue
-        if any(word in normalized for word in ("prefer", "interested", "looking for", "would like", "want to")):
+        if any(
+            word in normalized
+            for word in ("prefer", "interested", "looking for", "would like", "want to")
+        ):
             memory_type = MemoryType.PREFERENCE
         else:
             memory_type = MemoryType.FACT
@@ -744,9 +748,7 @@ def _cross_turn_transaction_facts(
                 memory_type=MemoryType.FACT,
                 confidence=0.99,
                 fact_key="transaction.coupon.redemption",
-                source_turn_indices=tuple(
-                    sorted({turn_index, store_turn_index})
-                ),
+                source_turn_indices=tuple(sorted({turn_index, store_turn_index})),
                 tags=("transaction", "coupon", "cross-turn", "user-fact"),
                 metadata={
                     "evidence_kind": "user_fact",
@@ -792,6 +794,40 @@ def _follow_up_topic_facts(
     return []
 
 
+def _source_context_facts(session: LongMemEvalSession) -> list[ExtractedFact]:
+    """Retain bounded source excerpts as a lossless fallback beside facts.
+
+    This mirrors the hybrid fact-plus-chunk pattern used by strong memory
+    systems: facts remain compact retrieval keys while source excerpts preserve
+    exact names, visual attributes, commands, and assistant answers.
+    """
+
+    messages = [
+        TranscriptMessage(role=turn.role, content=turn.content)
+        for turn in session.turns
+    ]
+    return [
+        ExtractedFact(
+            content=chunk.content,
+            title=f"Source conversation excerpt {index + 1}",
+            memory_type=MemoryType.CONTEXT,
+            confidence=0.98,
+            fact_key=f"source.transcript.chunk.{index}",
+            source_turn_indices=chunk.message_indices,
+            tags=("source-context", "verbatim", *chunk.roles),
+            metadata={
+                "evidence_kind": "source_context",
+                "source_context": True,
+                "retrieval_role": "source_context",
+                "source_roles": chunk.roles,
+                "explicit_user_evidence": chunk.roles == ("user",),
+                "temporal_anchor": session.date,
+            },
+        )
+        for index, chunk in enumerate(chunk_transcript_messages(messages))
+    ]
+
+
 def _augment_high_signal_evidence(
     session: LongMemEvalSession,
     facts: Sequence[ExtractedFact],
@@ -808,6 +844,7 @@ def _augment_high_signal_evidence(
             *_explicit_user_signal_facts(session, existing_facts=facts),
             *_cross_turn_transaction_facts(session),
             *_follow_up_topic_facts(session),
+            *_source_context_facts(session),
         ]
         if not fact.fact_key or fact.fact_key not in existing_keys
     ]
@@ -921,9 +958,7 @@ class LmStudioFactExtractor:
         if not sessions:
             return {}
 
-        jobs: list[
-            tuple[str, LongMemEvalSession, tuple[int, ...]]
-        ] = []
+        jobs: list[tuple[str, LongMemEvalSession, tuple[int, ...]]] = []
         for session in sessions:
             chunks = self._session_chunks(session)
             for _, (chunk, original_turn_indices) in enumerate(chunks):
@@ -1052,9 +1087,7 @@ class LmStudioFactExtractor:
             for session, facts in zip(sessions, recovered, strict=True)
         }
 
-    async def _extract_chunk(
-        self, session: LongMemEvalSession
-    ) -> list[ExtractedFact]:
+    async def _extract_chunk(self, session: LongMemEvalSession) -> list[ExtractedFact]:
         payload = self._build_payload(session)
         for attempt in range(self.retries + 1):
             try:
@@ -1364,13 +1397,11 @@ commentary outside the JSON object.
         except ValueError:
             status_code = 0
         if process.returncode != 0 or not 200 <= status_code < 300:
-            detail = response_body[:500] or stderr.decode(
-                "utf-8", errors="replace"
-            )[:500]
-            status = f"HTTP {status_code}" if status_code else "curl error"
-            raise _LmStudioRequestError(
-                f"{status} from {self.base_url}: {detail}"
+            detail = (
+                response_body[:500] or stderr.decode("utf-8", errors="replace")[:500]
             )
+            status = f"HTTP {status_code}" if status_code else "curl error"
+            raise _LmStudioRequestError(f"{status} from {self.base_url}: {detail}")
         try:
             decoded = json.loads(response_body)
         except json.JSONDecodeError as error:
@@ -1458,7 +1489,9 @@ def _facts_from_lm_studio_batch_response(
         lines = lines[:-1] if lines and lines[-1].strip() == "```" else lines
         content = "\n".join(lines).strip()
     decoded = json.loads(content)
-    if not isinstance(decoded, Mapping) or not isinstance(decoded.get("sessions"), list):
+    if not isinstance(decoded, Mapping) or not isinstance(
+        decoded.get("sessions"), list
+    ):
         raise ValueError("LM Studio batch response must contain a sessions array")
     result: dict[str, list[ExtractedFact]] = {}
     for session_payload in decoded["sessions"]:
@@ -1474,7 +1507,9 @@ def _facts_from_lm_studio_batch_response(
                 for fact in raw_facts
             ]
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"LM Studio returned an invalid batch fact: {error}") from error
+            raise ValueError(
+                f"LM Studio returned an invalid batch fact: {error}"
+            ) from error
     return result
 
 
@@ -1927,7 +1962,10 @@ async def ingest_longmemeval_question(
         return index, "miss", facts, None
 
     extracted_sessions = await asyncio.gather(
-        *(extract_session(index, session) for index, session in enumerate(question.sessions))
+        *(
+            extract_session(index, session)
+            for index, session in enumerate(question.sessions)
+        )
     )
 
     for index, status, facts, failure_message in sorted(
@@ -2003,9 +2041,7 @@ async def ingest_longmemeval_question(
         target_namespace, statuses=[MemoryStatus.ACTIVE]
     )
     previous_by_memory_key = {
-        str(memory.memory_key): memory
-        for memory in existing
-        if memory.memory_key
+        str(memory.memory_key): memory for memory in existing if memory.memory_key
     }
     created = await service.store_memories_bulk(requests)
     superseded_ids: list[str] = []

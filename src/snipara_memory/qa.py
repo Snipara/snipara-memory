@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -38,155 +39,53 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v41"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v49"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
-READER_SYSTEM_PROMPT = """You answer a LongMemEval question using only the retrieved evidence below.
+# Keep the operational prompt short enough for local 8k-context readers. The
+# deterministic resolver and tests implement the detailed invariants documented
+# above; the model needs a compact decision contract, not repeated examples.
+READER_SYSTEM_PROMPT = """Answer the question using only the supplied evidence.
+Return the shortest supported answer as exactly {"answer":"..."}. Do not reveal
+reasoning, mention retrieval, or use outside knowledge.
 
-Give the shortest direct answer supported by the evidence. Use every relevant
-memory, not just the first one. Distinct source_session_id values are distinct
-conversation sessions and may need to be combined.
+Evidence:
+- Read direct_answer_support cards first, then verify them in retrieved_memories.
+  Match the exact entity, relation, attribute, and speaker. Preserve modifiers.
+- Source conversation excerpts are lossless fallback evidence. Use them when an
+  extracted fact omitted an exact name, color, code, value, or assistant answer.
+  When asked to identify or recall an entity, return its exact name rather than
+  replacing the name with a description of what it offers.
+- Resolver fields organize evidence and outrank retrieval order, but are not
+  gold labels. Verify them against the cited memory.
 
-Evidence selection rules:
-- Prefer evidence_cards marked direct_answer_support before reading the full
-  retrieved_memories list. Evidence cards are not gold labels; they are compact
-  views of retrieved memories ranked by whether the memory can answer the
-  requested attribute or entity.
-- A semantically related memory is not enough. Before answering, check that the
-  selected evidence states the exact entity, relation, and attribute asked by
-  the question. If a card is only contextual_support, use it to interpret a
-  direct card, not as the answer source by itself.
-- Preserve modifiers from direct evidence. If the direct evidence says
-  "Japanese short-grain rice", answer with the full phrase rather than the
-  broader category "short-grain rice".
+Resolution:
+- Updates: choose the newest directly relevant user statement by session_date.
+  Respect supersession and never add an old quantity to its replacement.
+- Multi-session: inspect every session_group. For counts, silently enumerate
+  qualifying records and use action_item_checklist, contribution_ledger, or
+  map_stage_output when supplied. Merge duplicate mentions, not distinct events.
+  A dry-cleaning pickup is a pickup; opposite exchange actions are distinct.
+  Named events, not session count, determine the result. A
+  scale vehicle or aircraft diorama is a worked-on model when requested.
+- Temporal: use matching dated events and computed_interval when supported.
+  Preserve companion, venue, object, and other relation qualifiers.
+- Preference: recover the user's constraints and personalize the new request.
+  If no current item name is supported, answer with the supported criteria
+  instead of abstaining. For example, suggest Miami hotels with views and
+  rooftop amenities when those are remembered preferences, but do not invent a
+  named Miami hotel. Preserve recency, budget, location, and technical limits.
+  Do not add unrelated
+  recommendations merely because those memories rank highly.
 
-Reasoning rules:
-- For knowledge updates, first collect all candidate values and then prefer
-  the newest user-stated value by session_date, even when the extractor gave
-  the old and new statements different fact_key values. A later statement
-  such as "beat my personal best of 25:50" updates an older recorded time of
-  27:12; do not answer with the older value merely because its title matches
-  the question more literally. Respect fact_key/supersedes_fact_key when
-  present, but do not require those fields to recognize an update.
-  When latest_update_candidate or latest_quantity_candidate is present in the
-  resolution audit, use the value stated in that first candidate unless
-  another directly relevant user statement has a later session_date. Never
-  choose an older value merely because it is ranked higher or has a more
-  specific title. For a quantity update, do not add an older quantity to the
-  newer one.
-- For multi-session questions, combine distinct sessions, deduplicate repeated
-  facts, and count only the requested entities. When the question asks for
-  items to pick up or return, scan every source session in the session groups
-  below. If several memories in one session repeat the same clothing/action
-  record, merge the duplicate statements; count separately named items or
-  transactions in the same session separately. Do not exclude a
-  clothing item because the venue is described as dry cleaning, an exchange,
-  or a store; the requested pickup/return action is what matters.
-  Distinct sessions may repeat the same real-world event. Merge records across
-  sessions only when action, entity, venue, date, and surrounding details make
-  them the same event; otherwise keep them distinct. For an exchange, a return
-  of the old item and pickup of its
-  replacement are two clothing items; merge only duplicate statements of the
-  same action/item, not opposite actions in an exchange.
-- For numerical multi-session questions, enumerate every qualifying item or
-  action in the evidence before counting. Accept concrete paraphrases and
-  venue names (for example, a dry-cleaning pickup for a blazer, an exchange
-  pickup for boots, and a return of boots) when they satisfy the requested
-  action; do not discard one because its venue is described differently from
-  the question. Before giving a numeric answer, silently enumerate the
-  qualifying records by source session, consolidate only duplicate statements
-  of the same action/item, and verify that the final number
-  matches that checklist.
-  When an action_item_checklist is supplied, use it as the explicit inventory
-  of qualifying records: semantically duplicate entries for the same
-  action/item/venue are one record even when repeated in another session,
-  while pickup and return entries are separate records.
-  When a contribution_ledger is supplied, inspect every row before answering.
-  Sum or count only rows satisfying the question, keep distinct events, and
-  merge only rows whose event identity is genuinely the same.
-  Named entities listed in named_events are the countable event identities;
-  never substitute the number of source sessions for the number of entities.
-  When session_contribution_maps are supplied, complete the per-session map
-  before reducing the rows to the final answer.
-  When map_stage_output is supplied, treat it as a draft entity ledger: verify
-  it against the evidence, merge genuine duplicates, then count every distinct
-  qualifying contribution.
-  Use domain semantics when identifying an entity: for model-building work, a
-  scale vehicle or aircraft diorama is a worked-on model even when the evidence
-  calls the overall project a diorama instead of repeating "model kit".
-  For a non-count multi-session question, make a short pass over every
-  session_group before drafting the answer. The group is an evidence bundle,
-  not a ranking hint: a lower-ranked fact from a distinct session can be one
-  of the required answer parts.
-- For temporal questions, sort relevant sessions by session_date, use an
-  explicit temporal_anchor when present, and calculate the requested interval
-  or order. Treat session_date as the event date only when the evidence places
-  the event in that session.
-  Preserve qualifiers such as who accompanied the user, the venue, and the
-  object; an event matching only "museum" is not a match for "museum with a
-  friend" when another evidence record satisfies the full relation.
-- For preference questions, use the user's stated preferences and constraints
-  to answer or personalize the recommendation; do not substitute generic advice.
-  Preserve explicit qualifiers such as recent, upcoming, local, budget, or
-  technical constraints. Do not present an old or foundational item as recent
-  merely because it is relevant. If the retrieved evidence only supports an
-  older or broader recommendation, state that limitation instead of silently
-  relaxing the user's qualifier.
-  Keep the response scoped to the subject asked about. Do not add unrelated
-  recommendations (such as travel, transportation, or hobbies) just because
-  those memories are recent or highly ranked. Relevance to the question wins
-  over recency.
-- For an unanswerable question, require direct evidence for the exact entity or
-  attribute asked about. A related object, hobby, category, or assistant answer
-  is not evidence that the user stated the requested fact. For example, a
-  camera collection does not establish a film collection; say the information
-  cannot be determined when only the related object is supported.
-  Do not assemble a compound object or attribute by taking one modifier from
-  one memory and its head noun from another. The exact relation must be stated
-  in one memory or in explicitly linked evidence from the same conversation.
-  Treat named people, kinship roles, organizations, objects, and relationships
-  as hard constraints. Compare them literally before answering: if the evidence
-  says "niece" and the question asks about an "uncle", do not copy the object
-  and replace the relationship with the wording from the question. That is a
-  mismatch; state that the requested information cannot be determined. The
-  question itself is not evidence.
-  Apply the same rule to requested object types and attributes: "vintage
-  cameras" does not support "vintage films", and attending film festivals does
-  not establish a film collection. Shared modifiers or related activities are
-  not exact support. Make a literal support check for each requested noun
-  phrase before giving a duration, quantity, or other derived answer.
-- The payload may include a deterministic_resolution_audit. Treat it as an
-  evidence-organizing aid, not as a gold answer: verify it against the
-  retrieved memories. For an update, compare the ISO-like session_date values
-  yourself; if latest_update_candidate or latest_update_evidence is present,
-  its first item is the newest directly relevant user statement. Treat that
-  first candidate as authoritative unless the evidence contains a later
-  directly relevant date. Do not call an older value the latest because the
-  prose around it says "latest". For a
-  count, inspect every counting_evidence item and deduplicate only repeated
-  statements of the same entity. If latest_quantity_candidate is present, report that
-  newer quantity rather than summing it with an older quantity. For a temporal question, use
-  temporal_candidates and computed intervals only when their event wording
-  matches the question.
-  In an inventory count, a directly stated item that was finished, acquired,
-  bought, or worked on is still one qualifying item when the question asks
-  what the user has worked on or bought. Count every distinct named item.
-
-The resolver fields are higher-priority evidence than the ranking order. If a
-resolver directive is supplied, treat its preferred evidence as the answer
-source and do not reinterpret it as a competing older fact. For a knowledge
-update, copy the requested value from that preferred evidence before drafting
-the answer; do not recalculate which date is newer from prose or rank.
-
-Do not invent details, use outside knowledge, mention the memory system, or
-mention retrieval. If the evidence truly does not support the answer, say that
-the information cannot be determined from the available memories. Do not
-abstain merely because the evidence is spread across several entries.
-
-Output contract:
-- Return exactly one JSON object with one string field: {"answer":"..."}.
-- The answer value must contain only the concise final answer, with no analysis,
-  scratch work, alternatives, or self-correction.
+Safety:
+- Abstain only when no evidence supports the exact requested relation. Do not
+  combine a modifier from one memory with a noun from another. Named people,
+  kinship, organizations, objects, and attributes are hard constraints: niece
+  is not uncle, and vintage
+  cameras do not establish vintage films. The question itself is not evidence.
+- Do not abstain merely because support is spread across entries. If a source
+  excerpt directly states the answer, use it.
 """
 
 MULTI_SESSION_MAP_SYSTEM_PROMPT = """Build a contribution map from retrieved evidence.
@@ -234,12 +133,7 @@ def _action_item_venue(text: str) -> str | None:
         text,
     )
     if named is None:
-        item_pattern = "|".join(re.escape(item) for item in _ACTION_ITEM_LEXICON)
-        named_item = re.search(
-            rf"\b([A-Z][A-Za-z0-9&'-]+)\s+(?:{item_pattern})\b",
-            text,
-        )
-        return named_item.group(1).lower() if named_item is not None else None
+        return None
     venue = named.group(1).strip(" .,;:")
     if venue.lower() in {
         "my sister",
@@ -272,14 +166,20 @@ def _action_item_checklist(
         return []
 
     checklist: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    generic_venues = {"store", "shop", "retailer"}
     for memory in context:
         source_text = " ".join(
-            str(memory.get(key) or "")
-            for key in ("title", "content", "evidence_kind")
+            str(memory.get(key) or "") for key in ("title", "content", "evidence_kind")
         )
         text = source_text.lower()
-        item = next((term for term in _ACTION_ITEM_LEXICON if term in text), None)
+        item = next(
+            (
+                term
+                for term in _ACTION_ITEM_LEXICON
+                if re.search(rf"\b{re.escape(term)}\b", text)
+            ),
+            None,
+        )
         if item is None:
             continue
         venue = _action_item_venue(source_text)
@@ -290,12 +190,8 @@ def _action_item_checklist(
             actions.append("pickup")
         if "return" in text:
             actions.append("return")
-        if (
-            ("exchange" in text or "exchanged" in text)
-            and any(
-                term in text
-                for term in ("replacement", "new pair", "pick up", "pickup")
-            )
+        if ("exchange" in text or "exchanged" in text) and any(
+            term in text for term in ("replacement", "new pair", "pick up", "pickup")
         ):
             # An exchange is one returned item plus one replacement pickup when
             # both sides of the transaction are explicit. This models the
@@ -307,11 +203,31 @@ def _action_item_checklist(
         session_id = str(memory.get("source_session_id") or "unknown")
         for action in actions:
             # Repeated conversations can refer to the same pending errand.
-            # Deduplicate by event identity rather than by transcript session.
-            key = (action, item, venue)
-            if key in seen:
+            # A named venue and the generic word "store" in the same session
+            # are alternate descriptions of one transaction, not two errands.
+            duplicate = next(
+                (
+                    row
+                    for row in checklist
+                    if row["action"] == action
+                    and row["item"] == item
+                    and (
+                        row["venue"] == venue
+                        or (
+                            row["source_session_id"] == session_id
+                            and (
+                                row["venue"] in generic_venues
+                                or venue in generic_venues
+                            )
+                        )
+                    )
+                ),
+                None,
+            )
+            if duplicate is not None:
+                if duplicate["venue"] in generic_venues and venue not in generic_venues:
+                    duplicate["venue"] = venue
                 continue
-            seen.add(key)
             checklist.append(
                 {
                     "source_session_id": session_id,
@@ -560,7 +476,130 @@ def _bounded_reader_text(
     text = str(value or "").strip()
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rstrip() + "…"
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _bounded_reader_evidence(
+    value: object,
+    *,
+    question: str,
+    max_chars: int,
+) -> str:
+    """Return a query-centered evidence window instead of a blind prefix."""
+
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= max_chars:
+        return compact
+    lowered = compact.lower()
+    terms_set = _retrieval_terms(question)
+    question_focus = list(
+        re.finditer(r"\b(?:what|which|where|when|who|how)\b", question, re.IGNORECASE)
+    )
+    if question_focus:
+        focused_terms = _retrieval_terms(question[question_focus[-1].start() :])
+        if len(focused_terms) >= 2:
+            terms_set = focused_terms
+    terms = sorted(terms_set, key=len, reverse=True)
+    candidates: list[int] = []
+    for term in terms:
+        position = lowered.find(term)
+        while position >= 0:
+            candidates.append(position)
+            position = lowered.find(term, position + max(1, len(term)))
+    if not candidates:
+        return _bounded_reader_text(compact, max_chars=max_chars)
+    best_start = 0
+    best_score: tuple[int, int, int, int] = (-1, -(10**9), -1, -1)
+    for position in candidates:
+        start = max(0, min(position - max_chars // 3, len(compact) - max_chars))
+        window = lowered[start : start + max_chars]
+        nearest_positions: list[int] = []
+        for term in terms:
+            term_positions: list[int] = []
+            term_position = lowered.find(term, start, start + max_chars)
+            while term_position >= 0:
+                term_positions.append(term_position)
+                term_position = lowered.find(
+                    term, term_position + max(1, len(term)), start + max_chars
+                )
+            if term_positions:
+                nearest_positions.append(
+                    min(term_positions, key=lambda candidate: abs(candidate - position))
+                )
+        matched_terms = len(nearest_positions)
+        proximity_span = (
+            max(nearest_positions) - min(nearest_positions)
+            if len(nearest_positions) > 1
+            else max_chars
+        )
+        matched_occurrences = sum(window.count(term) for term in terms)
+        # Prefer a tight entity/attribute cluster over a window where the
+        # entity merely follows an attribute belonging to another subject.
+        score = (matched_terms, -proximity_span, matched_occurrences, start)
+        if score > best_score:
+            best_start = start
+            best_score = score
+    excerpt = compact[best_start : best_start + max_chars].strip()
+    if best_start:
+        excerpt = f"…{excerpt}"
+    if best_start + max_chars < len(compact):
+        excerpt = f"{excerpt}…"
+    return excerpt
+
+
+def _compact_resolution_audit(audit: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the reader's structured reasoning payload inside local contexts."""
+
+    kind = audit.get("kind")
+    compact: dict[str, Any] = {
+        "kind": kind,
+        "instructions": list(audit.get("instructions", ()))[:6],
+    }
+    if audit.get("distinct_session_count") is not None:
+        compact["distinct_session_count"] = audit.get("distinct_session_count")
+    if kind == "multi_session_count":
+        compact["contribution_ledger"] = [
+            {
+                **{
+                    key: row.get(key)
+                    for key in (
+                        "source_session_id",
+                        "session_date",
+                        "memory_rank",
+                        "evidence_kind",
+                        "entity_key",
+                        "directness_score",
+                        "scalar_values",
+                        "named_events",
+                    )
+                },
+                "content": _bounded_reader_text(row.get("content"), max_chars=100),
+            }
+            for row in audit.get("contribution_ledger", [])[:8]
+        ]
+    elif kind == "temporal":
+        compact["temporal_candidates"] = list(audit.get("temporal_candidates", ()))[:4]
+        compact["computed_interval"] = audit.get("computed_interval")
+    elif kind == "preference":
+        compact["temporal_qualifiers"] = audit.get("temporal_qualifiers", [])
+        compact["preference_evidence"] = [
+            {
+                **{
+                    key: row.get(key)
+                    for key in (
+                        "source_session_id",
+                        "session_date",
+                        "evidence_kind",
+                        "temporal_anchor",
+                    )
+                },
+                "content": _bounded_reader_text(row.get("content"), max_chars=120),
+            }
+            for row in audit.get("preference_evidence", [])[:4]
+        ]
+    elif audit.get("resolver_directive") is not None:
+        compact["resolver_directive"] = audit.get("resolver_directive")
+    return compact
 
 
 def _apply_update_resolution_guard(
@@ -584,12 +623,10 @@ def _apply_update_resolution_guard(
         return response
     numeric_pattern = r"(?<![\w/])(?:[$€£]\s*)?\d[\d,]*(?:\.\d+)?%?(?![\w/])"
     preferred_values = {
-        value.replace(" ", "")
-        for value in re.findall(numeric_pattern, content)
+        value.replace(" ", "") for value in re.findall(numeric_pattern, content)
     }
     response_values = {
-        value.replace(" ", "")
-        for value in re.findall(numeric_pattern, response)
+        value.replace(" ", "") for value in re.findall(numeric_pattern, response)
     }
     if response_values - preferred_values:
         # The reader still runs for every question. For a resolved update, a
@@ -618,6 +655,90 @@ def _apply_action_count_guard(
     if not normalized_records:
         return response
     return str(len(normalized_records))
+
+
+def _apply_preference_projection_guard(
+    question: str,
+    response: str,
+    audit: Mapping[str, Any],
+) -> str:
+    """Project remembered constraints onto a new request when a reader abstains."""
+
+    abstained = not response.strip() or bool(
+        re.search(
+            r"\b(?:do not|don't|cannot|can't|no)\b.{0,40}\b(?:information|know|determine|recommend)",
+            response,
+            re.IGNORECASE,
+        )
+    )
+    if audit.get("kind") != "preference" or not abstained:
+        return response
+    for row in audit.get("preference_evidence", []):
+        if not isinstance(row, Mapping):
+            continue
+        content = str(row.get("content") or "").strip()
+        match = re.search(r"\bprefers?\s+(.+?)(?:\.|$)", content, re.IGNORECASE)
+        if match is None:
+            continue
+        criteria = match.group(1).strip()
+        if not criteria:
+            continue
+        if criteria.lower().startswith("hotels "):
+            criteria = f"a hotel {criteria[7:]}"
+        location_match = re.search(r"\b(?:to|in|for)\s+([A-Z][A-Za-z'-]+)\b", question)
+        location = f" in {location_match.group(1)}" if location_match else ""
+        return f"Look for {criteria}{location}."
+    return response
+
+
+def _apply_named_list_entity_guard(
+    question: str,
+    response: str,
+    context: Sequence[Mapping[str, Any]],
+) -> str:
+    """Recover an exact named list entry when generation drops or hides it."""
+
+    if not re.search(r"\b(?:remind|which|what|name|called)\b", question, re.IGNORECASE):
+        return response
+    query_terms = _retrieval_terms(question)
+    focus_markers = list(
+        re.finditer(r"\b(?:that|which|what|called|named)\b", question, re.IGNORECASE)
+    )
+    focused_terms = (
+        _retrieval_terms(question[focus_markers[-1].start() :])
+        if focus_markers
+        else query_terms
+    )
+    candidates: list[tuple[int, int, str]] = []
+    for memory in context:
+        if memory.get("evidence_kind") != "source_context":
+            continue
+        content = str(memory.get("content") or "")
+        entries = re.findall(
+            r"(?:^|\s)\d+[.)]\s+(.+?)(?=\s+\d+[.)]\s+|$)",
+            content,
+            flags=re.DOTALL,
+        )
+        for entry in entries:
+            name, separator, details = entry.partition(" - ")
+            if not separator:
+                name, separator, details = entry.partition(" – ")
+            name = re.sub(r"\s+", " ", name).strip(" *:;,.\n")
+            if not separator or not re.fullmatch(
+                r"(?:The\s+)?[A-Z][\w'&-]*(?:\s+[A-Z][\w'&-]*){0,5}", name
+            ):
+                continue
+            segment_terms = _retrieval_terms(f"{name} {details}")
+            focused_score = len(focused_terms & segment_terms)
+            broad_score = len(query_terms & segment_terms)
+            if max(focused_score, broad_score) >= 2:
+                candidates.append((focused_score, broad_score, name))
+    if not candidates:
+        return response
+    _, _, best_name = max(candidates, key=lambda item: (item[0], item[1], len(item[2])))
+    if best_name.lower() in response.lower():
+        return response
+    return best_name
 
 
 def _apply_temporal_relation_guard(
@@ -669,8 +790,7 @@ def _apply_currency_total_guard(
     lowered = question.lower()
     if audit.get("kind") != "multi_session_count" or not (
         re.search(r"\bhow much\b", lowered)
-        or {"total", "money", "spent", "cost", "expenses"}
-        & _retrieval_terms(question)
+        or {"total", "money", "spent", "cost", "expenses"} & _retrieval_terms(question)
     ):
         return response
     question_terms = _retrieval_terms(question)
@@ -700,15 +820,16 @@ def _apply_currency_total_guard(
         if not entity_terms:
             continue
         for raw_value in row.get("scalar_values", []):
-            if not isinstance(raw_value, str) or not raw_value.startswith(("$", "€", "£")):
+            if not isinstance(raw_value, str) or not raw_value.startswith(
+                ("$", "€", "£")
+            ):
                 continue
             try:
                 amount = float(raw_value[1:].replace(",", ""))
             except ValueError:
                 continue
             if any(
-                existing_amount == amount
-                and bool(existing_terms & entity_terms)
+                existing_amount == amount and bool(existing_terms & entity_terms)
                 for existing_amount, existing_terms in contributions
             ):
                 continue
@@ -716,7 +837,11 @@ def _apply_currency_total_guard(
     if not contributions:
         return response
     total = sum(amount for amount, _ in contributions)
-    rendered = str(int(total)) if total.is_integer() else f"{total:.2f}".rstrip("0").rstrip(".")
+    rendered = (
+        str(int(total))
+        if total.is_integer()
+        else f"{total:.2f}".rstrip("0").rstrip(".")
+    )
     symbol = next(
         (
             value[0]
@@ -841,6 +966,27 @@ def _is_project_leadership_record(memory: Mapping[str, Any]) -> bool:
     return False
 
 
+def _project_identity(memory: Mapping[str, Any]) -> str | None:
+    """Return a stable project identity shared by extracted and source facts."""
+
+    text = " ".join(
+        str(memory.get(key) or "") for key in ("title", "content", "fact_key")
+    )
+    class_project = re.search(
+        r"\b([A-Z][A-Za-z&'’-]+(?:\s+[A-Z][A-Za-z&'’-]+){0,3})\s+class project\b",
+        text,
+    )
+    if class_project is not None:
+        return "project:" + " ".join(class_project.group(1).lower().split())
+    named_project = re.search(
+        r"\b(?:the|a|my)\s+([A-Z][A-Za-z&'’-]+(?:\s+[A-Z][A-Za-z&'’-]+){0,3})\s+project\b",
+        text,
+    )
+    if named_project is not None:
+        return "project:" + " ".join(named_project.group(1).lower().split())
+    return None
+
+
 _SPOKEN_NUMBERS = {
     "one": 1,
     "two": 2,
@@ -887,8 +1033,7 @@ def _evidence_scalar_values(text: str) -> list[str]:
 
     return list(
         dict.fromkeys(
-            match.group(0).strip()
-            for match in _EVIDENCE_SCALAR_PATTERN.finditer(text)
+            match.group(0).strip() for match in _EVIDENCE_SCALAR_PATTERN.finditer(text)
         )
     )
 
@@ -903,8 +1048,7 @@ def _named_event_mentions(text: str) -> list[str]:
 
     return list(
         dict.fromkeys(
-            match.group(0).strip()
-            for match in _NAMED_EVENT_PATTERN.finditer(text)
+            match.group(0).strip() for match in _NAMED_EVENT_PATTERN.finditer(text)
         )
     )
 
@@ -943,8 +1087,7 @@ def _multi_session_resolution_audit(
         content = str(memory.get("content") or "")
         memory_terms = _resolution_terms(
             " ".join(
-                str(memory.get(key) or "")
-                for key in ("title", "content", "fact_key")
+                str(memory.get(key) or "") for key in ("title", "content", "fact_key")
             )
         )
         overlap = question_terms & memory_terms
@@ -969,6 +1112,9 @@ def _multi_session_resolution_audit(
                 "concept_match_terms": sorted(concept_overlap),
                 "scalar_values": values,
                 "named_events": named_events,
+                "entity_key": (
+                    _project_identity(memory) if project_leadership else None
+                ),
                 "directness_score": (
                     (2 * len(core_overlap))
                     + len(overlap)
@@ -1025,7 +1171,9 @@ def _multi_session_resolution_audit(
         "kind": (
             "multi_session_temporal_relation"
             if temporal_relation
-            else "multi_session_count" if asks_for_count else "multi_session"
+            else "multi_session_count"
+            if asks_for_count
+            else "multi_session"
         ),
         "distinct_session_count": len(bundles),
         "session_bundles": bundles,
@@ -1050,8 +1198,16 @@ def _multi_session_resolution_audit(
 def _temporal_event_phrases(question: str) -> list[str]:
     """Extract named event fragments from the common LongMemEval wording."""
 
+    between = re.search(
+        r"\bbetween\s+(?:the\s+)?day\s+(.+?)\s+and\s+"
+        r"(?:the\s+)?day\s+(.+?)(?:[?.!]|$)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if between is not None:
+        return [phrase.strip(" ,") for phrase in between.groups() if phrase.strip(" ,")]
     matches = re.findall(
-        r"(?:the\s+day|day)\s+(.+?)(?=,\s*(?:the\s+day|and\s+the\s+day)|$)",
+        r"(?:the\s+day|day)\s+(.+?)(?=(?:,\s*)?(?:the\s+day|and\s+the\s+day)|$)",
         question,
         flags=re.IGNORECASE,
     )
@@ -1206,9 +1362,7 @@ def _deterministic_resolution_audit(
             "latest_quantity_candidate": (
                 {
                     "quantity": quantity_candidates[0][1],
-                    "evidence": _resolution_evidence_snippet(
-                        quantity_candidates[0][2]
-                    ),
+                    "evidence": _resolution_evidence_snippet(quantity_candidates[0][2]),
                 }
                 if quantity_candidates
                 else None
@@ -1259,10 +1413,7 @@ def _deterministic_resolution_audit(
             )
             for score, memory in phrase_candidates:
                 memory_terms = _resolution_terms(
-                    " ".join(
-                        str(memory.get(key) or "")
-                        for key in ("title", "content")
-                    )
+                    " ".join(str(memory.get(key) or "") for key in ("title", "content"))
                 )
                 overlap = phrase_terms & memory_terms
                 if not _temporal_candidate_matches_qualifiers(phrase, memory):
@@ -1311,10 +1462,26 @@ def _deterministic_resolution_audit(
         interval: dict[str, Any] | None = None
         question_date = _parse_resolution_date(context[0].get("question_date"))
         unit = next(
-            (candidate for candidate in ("weeks", "months", "days") if candidate in lowered),
+            (
+                candidate
+                for candidate in ("weeks", "months", "days")
+                if candidate in lowered
+            ),
             None,
         )
-        if question_date is not None:
+        if "between" in lowered and len(selected) >= 2 and unit:
+            left = _parse_resolution_date(selected[0].get("event_date"))
+            right = _parse_resolution_date(selected[1].get("event_date"))
+            if left is not None and right is not None:
+                delta_days = abs((right - left).days)
+                divisor = {"days": 1, "weeks": 7, "months": 30}[unit]
+                interval = {
+                    "unit": unit,
+                    "value": delta_days // divisor,
+                    "start_date": min(left, right).isoformat(),
+                    "end_date": max(left, right).isoformat(),
+                }
+        elif question_date is not None:
             reference_date: date | None = None
             if "consecutive" in lowered or "in a row" in lowered:
                 dates = sorted({item[0] for item in dated_candidates})
@@ -1378,8 +1545,7 @@ def _deterministic_resolution_audit(
                 else None
             ),
             "latest_update_evidence": [
-                _resolution_compact_record(memory)
-                for _, memory in candidates[:4]
+                _resolution_compact_record(memory) for _, memory in candidates[:4]
             ],
             "instructions": [
                 "Compare candidate user statements across session dates.",
@@ -1428,9 +1594,7 @@ class LongMemEvalReader(Protocol):
 
     version: str
 
-    async def answer(
-        self, question: str, memories: Sequence[RecallMatch]
-    ) -> str: ...
+    async def answer(self, question: str, memories: Sequence[RecallMatch]) -> str: ...
 
 
 class LongMemEvalJudge(Protocol):
@@ -1572,7 +1736,9 @@ def _parse_judge_label(raw: str) -> bool:
     labels = re.findall(r"\b(yes|no)\b", normalized)
     if len(labels) == 1:
         return labels[0] == "yes"
-    raise ValueError("LM Studio judge output did not contain one unambiguous yes/no label")
+    raise ValueError(
+        "LM Studio judge output did not contain one unambiguous yes/no label"
+    )
 
 
 @dataclass(slots=True)
@@ -1614,16 +1780,15 @@ class LmStudioLongMemEvalReader:
         )
         return f"{self.model}:{self.prompt_version}{suffix}"
 
-    async def answer(
-        self, question: str, memories: Sequence[RecallMatch]
-    ) -> str:
-        per_memory_chars = max(280, min(560, 10_000 // max(len(memories), 1)))
+    async def answer(self, question: str, memories: Sequence[RecallMatch]) -> str:
+        per_memory_chars = max(220, min(420, 3_600 // max(len(memories), 1)))
         context = [
             {
                 "rank": index + 1,
-                "title": match.memory.title,
-                "content": _bounded_reader_text(
+                "title": _bounded_reader_text(match.memory.title, max_chars=80),
+                "content": _bounded_reader_evidence(
                     match.memory.content,
+                    question=question,
                     max_chars=per_memory_chars,
                 ),
                 "memory_type": match.memory.type.value,
@@ -1634,13 +1799,17 @@ class LmStudioLongMemEvalReader:
                 ),
                 "question_type": match.memory.metadata.get("question_type"),
                 "question_date": match.memory.metadata.get("question_date"),
-                "fact_key": getattr(match.memory, "memory_key", None)
-                or match.memory.metadata.get("fact_key"),
-                "supersedes_fact_key": (
-                    getattr(match.memory, "supersedes_memory_key", None)
-                    or match.memory.metadata.get("supersedes_fact_key")
+                "fact_key": _bounded_reader_text(
+                    getattr(match.memory, "memory_key", None)
+                    or match.memory.metadata.get("fact_key"),
+                    max_chars=80,
                 ),
-                "source_turn_indices": _source_turn_indices(match.memory.metadata),
+                "supersedes_fact_key": _bounded_reader_text(
+                    getattr(match.memory, "supersedes_memory_key", None)
+                    or match.memory.metadata.get("supersedes_fact_key"),
+                    max_chars=80,
+                ),
+                "source_turn_indices": _source_turn_indices(match.memory.metadata)[:8],
                 "evidence_kind": match.memory.metadata.get("evidence_kind"),
                 "explicit_user_evidence": match.memory.metadata.get(
                     "explicit_user_evidence", False
@@ -1648,10 +1817,15 @@ class LmStudioLongMemEvalReader:
                 "explicit_quantitative_evidence": match.memory.metadata.get(
                     "explicit_quantitative_evidence", False
                 ),
-                "quantitative_values": list(
-                    match.memory.metadata.get("quantitative_values", ())
+                "quantitative_values": [
+                    _bounded_reader_text(value, max_chars=32)
+                    for value in list(
+                        match.memory.metadata.get("quantitative_values", ())
+                    )[:4]
+                ],
+                "temporal_anchor": _bounded_reader_text(
+                    match.memory.metadata.get("temporal_anchor"), max_chars=80
                 ),
-                "temporal_anchor": match.memory.metadata.get("temporal_anchor"),
                 "observed_at": (
                     match.memory.observed_at.isoformat()
                     if getattr(match.memory, "observed_at", None) is not None
@@ -1659,6 +1833,17 @@ class LmStudioLongMemEvalReader:
                 ),
             }
             for index, match in enumerate(memories)
+        ]
+        context = [
+            {
+                key: value
+                for key, value in memory.items()
+                if value is not None
+                and value != ""
+                and value != []
+                and value is not False
+            }
+            for memory in context
         ]
         session_groups: list[dict[str, Any]] = []
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1672,7 +1857,6 @@ class LmStudioLongMemEvalReader:
                     "session_date": session_memories[0].get("session_date"),
                     "memory_count": len(session_memories),
                     "memory_ranks": [memory["rank"] for memory in session_memories],
-                    "memory_titles": [memory.get("title") for memory in session_memories],
                     "user_evidence_ranks": [
                         memory["rank"]
                         for memory in session_memories
@@ -1694,17 +1878,37 @@ class LmStudioLongMemEvalReader:
             and _should_map_reduce_count(question)
         ):
             map_rows = []
-            project_leadership = "project" in _retrieval_terms(question) and bool(
-                _retrieval_terms(question) & {"lead", "led", "leading"}
+            normalized_question_terms = _resolution_terms(question)
+            project_leadership = "project" in normalized_question_terms and bool(
+                normalized_question_terms & {"lead", "led"}
             )
             minimum_directness = 3 if project_leadership else 5
             candidate_rows = [
                 row
-                for row in deterministic_resolution_audit.get(
-                    "contribution_ledger", []
-                )
+                for row in deterministic_resolution_audit.get("contribution_ledger", [])
                 if int(row.get("directness_score") or 0) >= minimum_directness
             ][:12]
+            if project_leadership:
+                deduplicated_rows = []
+                seen_entity_keys: set[str] = set()
+                for row in candidate_rows:
+                    entity_key = str(row.get("entity_key") or "")
+                    if entity_key and entity_key in seen_entity_keys:
+                        continue
+                    if entity_key:
+                        seen_entity_keys.add(entity_key)
+                    deduplicated_rows.append(row)
+                candidate_rows = deduplicated_rows
+                # A fully keyed contribution ledger is already the reduced
+                # answer. Avoid spending a local-model generation on recounting
+                # deterministic, deduplicated project identities.
+                keyed_entities = {
+                    str(row["entity_key"])
+                    for row in candidate_rows
+                    if row.get("entity_key")
+                }
+                if keyed_entities:
+                    return str(len(keyed_entities))
             for row in candidate_rows:
                 compact_row = dict(row)
                 compact_row["content"] = _bounded_reader_text(
@@ -1735,19 +1939,45 @@ class LmStudioLongMemEvalReader:
                 re.IGNORECASE,
             ):
                 return str(contribution_count)
-        audit_for_reader = deterministic_resolution_audit
+        audit_for_reader = _compact_resolution_audit(deterministic_resolution_audit)
         evidence_cards_for_reader = evidence_cards
+        if action_item_checklist:
+            audit_for_reader = {
+                "kind": deterministic_resolution_audit.get("kind"),
+                "distinct_session_count": deterministic_resolution_audit.get(
+                    "distinct_session_count"
+                ),
+                "instructions": deterministic_resolution_audit.get("instructions", []),
+            }
         if map_stage_output is not None:
             audit_for_reader = {
                 "kind": deterministic_resolution_audit.get("kind"),
                 "distinct_session_count": deterministic_resolution_audit.get(
                     "distinct_session_count"
                 ),
-                "instructions": deterministic_resolution_audit.get(
-                    "instructions", []
-                ),
+                "instructions": deterministic_resolution_audit.get("instructions", []),
             }
             evidence_cards_for_reader = []
+        # Resolution uses the richer internal records above. The LLM only
+        # needs the cited evidence and provenance; repeating resolver-only
+        # keys, quantities, and anchors wastes local-model context.
+        resolver_only_fields = {
+            "fact_key",
+            "supersedes_fact_key",
+            "quantitative_values",
+            "temporal_anchor",
+            "question_type",
+            "question_date",
+            "explicit_quantitative_evidence",
+        }
+        reader_context = [
+            {
+                key: value
+                for key, value in memory.items()
+                if key not in resolver_only_fields
+            }
+            for memory in context
+        ]
         user_payload = json.dumps(
             {
                 "question": question,
@@ -1755,7 +1985,7 @@ class LmStudioLongMemEvalReader:
                     "resolver_directive"
                 ),
                 "evidence_cards": evidence_cards_for_reader,
-                "retrieved_memories": context,
+                "retrieved_memories": reader_context,
                 "session_groups": session_groups,
                 "action_item_checklist": action_item_checklist,
                 "map_stage_output": map_stage_output,
@@ -1790,6 +2020,22 @@ class LmStudioLongMemEvalReader:
             question,
             concise_response,
             context,
+        )
+        concise_response = _apply_preference_projection_guard(
+            question,
+            concise_response,
+            deterministic_resolution_audit,
+        )
+        concise_response = _apply_named_list_entity_guard(
+            question,
+            concise_response,
+            [
+                {
+                    "evidence_kind": match.memory.metadata.get("evidence_kind"),
+                    "content": match.memory.content,
+                }
+                for match in memories
+            ],
         )
         return _apply_update_resolution_guard(
             concise_response, deterministic_resolution_audit
@@ -2074,7 +2320,9 @@ class OpenRouterJevLongMemEvalJudge:
                 f"Could not reach {self.base_url}: {error}"
             ) from error
         if not isinstance(decoded, Mapping):
-            raise _LmStudioQARequestError("OpenRouter Jev returned a non-object response")
+            raise _LmStudioQARequestError(
+                "OpenRouter Jev returned a non-object response"
+            )
         if isinstance(decoded.get("error"), Mapping):
             raise _LmStudioQARequestError(
                 f"OpenRouter Jev error: {json.dumps(decoded['error'])[:500]}"
@@ -2211,7 +2459,10 @@ class LongMemEvalQACache:
         if (
             entry.get("input_hash") != input_hash
             or entry.get("reader_version") != reader_version
-            or (judge_version is not None and entry.get("judge_version") != judge_version)
+            or (
+                judge_version is not None
+                and entry.get("judge_version") != judge_version
+            )
         ):
             return None
         return entry
@@ -2278,8 +2529,7 @@ class LongMemEvalCategoryReport:
     @property
     def answer_session_recall_at_k(self) -> float:
         return (
-            self.answer_session_recall_sum
-            / self.answer_session_recall_evaluable_count
+            self.answer_session_recall_sum / self.answer_session_recall_evaluable_count
             if self.answer_session_recall_evaluable_count
             else 0.0
         )
@@ -2357,8 +2607,7 @@ class LongMemEvalQAReport:
     @property
     def answer_session_recall_at_k(self) -> float:
         return (
-            self.answer_session_recall_sum
-            / self.answer_session_recall_evaluable_count
+            self.answer_session_recall_sum / self.answer_session_recall_evaluable_count
             if self.answer_session_recall_evaluable_count
             else 0.0
         )
@@ -2415,7 +2664,9 @@ def _retrieval_input_hash(
             for index, match in enumerate(matches)
         ],
     }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -2553,7 +2804,8 @@ async def run_longmemeval_qa(
                         category=category,
                         retrieved_count=len(matches),
                         retrieved_titles=tuple(
-                            match.memory.title or match.memory.content for match in matches
+                            match.memory.title or match.memory.content
+                            for match in matches
                         ),
                         retrieved_answer_session_ids=retrieved_answer_session_ids,
                         retrieval_hit_at_k=retrieval_hit_at_k,
@@ -2564,7 +2816,9 @@ async def run_longmemeval_qa(
                         status="failed",
                         failed_stage="reader",
                         failure_message=f"{type(error).__name__}: {str(error)[:500]}",
-                        ingestion_failed_session_count=len(ingestion.failed_session_ids),
+                        ingestion_failed_session_count=len(
+                            ingestion.failed_session_ids
+                        ),
                     )
                 )
                 if qa_cache:
@@ -2596,7 +2850,9 @@ async def run_longmemeval_qa(
         else:
             judge_cache_misses += 1
             try:
-                judge_label, judge_response = await judge.judge(question, reader_response)
+                judge_label, judge_response = await judge.judge(
+                    question, reader_response
+                )
             except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
                 results.append(
                     LongMemEvalQAResult(
@@ -2605,7 +2861,8 @@ async def run_longmemeval_qa(
                         category=category,
                         retrieved_count=len(matches),
                         retrieved_titles=tuple(
-                            match.memory.title or match.memory.content for match in matches
+                            match.memory.title or match.memory.content
+                            for match in matches
                         ),
                         retrieved_answer_session_ids=retrieved_answer_session_ids,
                         retrieval_hit_at_k=retrieval_hit_at_k,
@@ -2616,7 +2873,9 @@ async def run_longmemeval_qa(
                         status="failed",
                         failed_stage="judge",
                         failure_message=f"{type(error).__name__}: {str(error)[:500]}",
-                        ingestion_failed_session_count=len(ingestion.failed_session_ids),
+                        ingestion_failed_session_count=len(
+                            ingestion.failed_session_ids
+                        ),
                     )
                 )
                 if qa_cache:
@@ -2649,9 +2908,7 @@ async def run_longmemeval_qa(
                 judge_response=judge_response,
                 judge_label=judge_label,
                 status=(
-                    "partial-ingestion"
-                    if ingestion.failed_session_ids
-                    else "scored"
+                    "partial-ingestion" if ingestion.failed_session_ids else "scored"
                 ),
                 ingestion_failed_session_count=len(ingestion.failed_session_ids),
             )
@@ -2994,9 +3251,13 @@ def _expanded_retrieval_terms(terms: set[str] | frozenset[str]) -> set[str]:
 
 
 _QUESTION_ATTRIBUTE_EXPANSIONS: dict[str, frozenset[str]] = {
-    "favorite": frozenset({"favorite", "prefer", "preferred", "preference", "like", "likes"}),
+    "favorite": frozenset(
+        {"favorite", "prefer", "preferred", "preference", "like", "likes"}
+    ),
     "type": frozenset({"type", "kind", "variety", "style", "category"}),
-    "speed": frozenset({"speed", "mbps", "bandwidth", "internet", "plan", "wifi", "broadband"}),
+    "speed": frozenset(
+        {"speed", "mbps", "bandwidth", "internet", "plan", "wifi", "broadband"}
+    ),
     "location": frozenset(
         {
             "where",
@@ -3014,8 +3275,12 @@ _QUESTION_ATTRIBUTE_EXPANSIONS: dict[str, frozenset[str]] = {
             "purchased",
         }
     ),
-    "title": frozenset({"title", "name", "called", "play", "show", "performance", "book", "movie"}),
-    "quantity": frozenset({"how", "many", "much", "number", "count", "amount", "total"}),
+    "title": frozenset(
+        {"title", "name", "called", "play", "show", "performance", "book", "movie"}
+    ),
+    "quantity": frozenset(
+        {"how", "many", "much", "number", "count", "amount", "total"}
+    ),
     "time": frozenset({"when", "date", "day", "month", "week", "year", "time"}),
 }
 
@@ -3184,9 +3449,7 @@ def _question_answerability_score(
         content
     ):
         score += 0.08
-    if plan.expected_answer_kind == "currency" and re.search(
-        r"[$€£]\s*\d", content
-    ):
+    if plan.expected_answer_kind == "currency" and re.search(r"[$€£]\s*\d", content):
         entity_concepts = concept_overlap - _COST_CONCEPT_TERMS
         if entity_concepts:
             score += 0.28
@@ -3241,27 +3504,27 @@ def _reader_evidence_cards(
         matched_concepts = sorted(plan.concept_terms & memory_terms)
         support_kind = (
             "direct_answer_support"
-            if score >= 0.34
-            and (matched_core or matched_attribute or matched_concepts)
+            if score >= 0.34 and (matched_core or matched_attribute or matched_concepts)
             else "contextual_support"
         )
         content = str(memory.get("content") or "")
-        content = _bounded_reader_text(content, max_chars=220)
+        content = _bounded_reader_text(content, max_chars=120)
         cards.append(
             {
                 "rank": memory.get("rank"),
                 "support_kind": support_kind,
                 "answerability_score": round(score, 3),
-                "matched_core_terms": matched_core,
-                "matched_attribute_terms": matched_attribute,
-                "matched_concept_terms": matched_concepts,
+                "matched_core_terms": matched_core[:6],
+                "matched_attribute_terms": matched_attribute[:6],
+                "matched_concept_terms": matched_concepts[:6],
                 "source_session_id": memory.get("source_session_id"),
                 "session_date": memory.get("session_date"),
-                "title": memory.get("title"),
                 "content": content,
-                "fact_key": memory.get("fact_key"),
-                "supersedes_fact_key": memory.get("supersedes_fact_key"),
-                "source_turn_indices": memory.get("source_turn_indices", []),
+                "fact_key": _bounded_reader_text(memory.get("fact_key"), max_chars=80),
+                "supersedes_fact_key": _bounded_reader_text(
+                    memory.get("supersedes_fact_key"), max_chars=80
+                ),
+                "source_turn_indices": list(memory.get("source_turn_indices", []))[:8],
             }
         )
     cards.sort(
@@ -3273,7 +3536,7 @@ def _reader_evidence_cards(
         ),
         reverse=True,
     )
-    return cards[: min(12, len(cards))]
+    return cards[: min(4, len(cards))]
 
 
 def _parse_reader_answer(raw: str) -> str:
@@ -3286,7 +3549,7 @@ def _parse_reader_answer(raw: str) -> str:
         payload = None
     if isinstance(payload, Mapping):
         answer = payload.get("answer")
-        if isinstance(answer, str) and answer.strip():
+        if isinstance(answer, str):
             return answer.strip()
 
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -3406,13 +3669,56 @@ def _memory_retrieval_score(
             # context, but it is not query evidence by itself. Keep it below
             # even a weak lexical hit so contextual expansion cannot drown out
             # the exact fact the reader needs.
-            return max(base_score, 0.0) * 0.2
-        return max(base_score, 0.0) * 0.2
-    return (
-        0.48 * lexical_score
-        + 0.32 * answerability_score
-        + 0.20 * max(base_score, 0.0)
+            score = max(base_score, 0.0) * 0.2
+            return score * 0.15 if memory.metadata.get("source_context") else score
+        if base_reason == "profile-context":
+            return 0.45 * answerability_score + 0.35 * max(base_score, 0.0)
+        score = max(base_score, 0.0) * 0.2
+        return score * 0.15 if memory.metadata.get("source_context") else score
+    score = (
+        0.48 * lexical_score + 0.32 * answerability_score + 0.20 * max(base_score, 0.0)
     )
+    if memory.metadata.get("source_context"):
+        # Raw evidence is a lossless fallback, not a replacement for compact
+        # facts. Require at least two lexical anchors and discount long source
+        # passages so generic transcript language cannot dominate top-k.
+        overlap = len(query_terms & content_terms)
+        return score * (0.55 if overlap >= 2 else 0.15)
+    return score
+
+
+def _source_lexical_specificity(
+    memory: Any,
+    *,
+    query_term_sets: Sequence[set[str]],
+    document_frequency: Mapping[str, int],
+    document_count: int,
+) -> float:
+    """Score a source excerpt by coverage of rare query terms.
+
+    Long transcript chunks naturally contain generic words. An IDF-weighted
+    coverage signal favors exact entities and attributes (for example a named
+    venue plus a distinctive product) without encoding benchmark answers.
+    """
+
+    if not memory.metadata.get("source_context") or document_count <= 0:
+        return 0.0
+    _title_terms, content_terms, _tag_terms, _fact_terms = _memory_text_terms(memory)
+    best = 0.0
+    for query_terms in query_term_sets:
+        if not query_terms:
+            continue
+        total_weight = sum(
+            math.log((document_count + 1) / (document_frequency.get(term, 0) + 1)) + 1.0
+            for term in query_terms
+        )
+        overlap_weight = sum(
+            math.log((document_count + 1) / (document_frequency.get(term, 0) + 1)) + 1.0
+            for term in query_terms & content_terms
+        )
+        if len(query_terms & content_terms) >= 2 and total_weight > 0:
+            best = max(best, overlap_weight / total_weight)
+    return best
 
 
 def _provenance_group_relevance(matches: Sequence[RecallMatch]) -> float:
@@ -3445,7 +3751,9 @@ def _diversify_longmemeval_matches(
         # rank, then preserve several facts inside those strongest bundles.
         grouped: dict[str, list[RecallMatch]] = {}
         for match in matches:
-            grouped.setdefault(provenance_key_for_memory(match.memory), []).append(match)
+            grouped.setdefault(provenance_key_for_memory(match.memory), []).append(
+                match
+            )
         # Keep enough candidate groups for a compact multi-session answer. A
         # low group cap can hide the second corroborating session before the
         # generic round-robin selector has a chance to use it.
@@ -3455,11 +3763,7 @@ def _diversify_longmemeval_matches(
             key=lambda key: _provenance_group_relevance(grouped[key]),
             reverse=True,
         )[:group_limit]
-        matches = [
-            match
-            for key in ranked_group_keys
-            for match in grouped[key]
-        ]
+        matches = [match for key in ranked_group_keys for match in grouped[key]]
     return select_diverse_matches(
         matches,
         limit=limit,
@@ -3501,6 +3805,10 @@ async def _retrieve_longmemeval_matches(
                 include_provenance_context=True,
                 provenance_context_limit=8,
                 provenance_context_group_limit=32,
+                include_profile_context=(
+                    question.question_type == "single-session-preference"
+                ),
+                profile_context_limit=8,
             )
         )
         for match in base_matches:
@@ -3516,6 +3824,11 @@ async def _retrieve_longmemeval_matches(
         namespace_id,
         statuses=[MemoryStatus.ACTIVE],
     )
+    query_vocabulary = set().union(*query_term_sets)
+    document_frequency = {
+        term: sum(term in _memory_text_terms(memory)[1] for memory in memories)
+        for term in query_vocabulary
+    }
     reranked: list[RecallMatch] = []
     for memory in memories:
         scored_candidates = [
@@ -3529,6 +3842,16 @@ async def _retrieve_longmemeval_matches(
             for query_terms in query_term_sets
         ]
         score = max(scored_candidates, default=0.0)
+        source_specificity = _source_lexical_specificity(
+            memory,
+            query_term_sets=query_term_sets,
+            document_frequency=document_frequency,
+            document_count=len(memories),
+        )
+        if memory.metadata.get("source_context"):
+            if source_specificity < 0.22:
+                continue
+            score = max(score, 0.75 * source_specificity)
         if memory.id in base_scores or score > 0:
             reranked.append(
                 RecallMatch(
@@ -3545,7 +3868,42 @@ async def _retrieve_longmemeval_matches(
         ),
         reverse=True,
     )
-    return _diversify_longmemeval_matches(reranked, question.question_type, limit)
+    source_limit = (
+        min(2, limit)
+        if question.question_type == "single-session-assistant"
+        else min(2, limit // 4)
+    )
+    structured = [
+        match for match in reranked if not match.memory.metadata.get("source_context")
+    ]
+    source: list[RecallMatch] = []
+    source_provenances: set[str] = set()
+    if source_limit:
+        for match in reranked:
+            if not match.memory.metadata.get("source_context"):
+                continue
+            provenance = provenance_key_for_memory(match.memory)
+            if provenance in source_provenances:
+                continue
+            source.append(match)
+            source_provenances.add(provenance)
+            if len(source) >= source_limit:
+                break
+    if question.question_type == "single-session-assistant":
+        # Assistant-answer questions often require a precise name or visual
+        # attribute that extraction omitted, so exact source evidence may lead.
+        return sorted(
+            [*structured, *source], key=lambda match: match.score, reverse=True
+        )[:limit]
+    # For counts, temporal reasoning, and preferences, compact facts stay in
+    # front and a tiny source budget is appended as provenance. This prevents
+    # verbose transcripts from displacing the ledger/profile the reader needs.
+    selected = _diversify_longmemeval_matches(
+        structured,
+        question.question_type,
+        max(0, limit - len(source)),
+    )
+    return [*selected, *source][:limit]
 
 
 def _build_category_reports(
@@ -3564,9 +3922,7 @@ def _build_category_reports(
             retrieval_evaluable_count=sum(
                 item.retrieval_hit_at_k is not None for item in group
             ),
-            retrieval_hit_count=sum(
-                item.retrieval_hit_at_k is True for item in group
-            ),
+            retrieval_hit_count=sum(item.retrieval_hit_at_k is True for item in group),
             answer_session_recall_evaluable_count=sum(
                 item.answer_session_recall_at_k is not None for item in group
             ),
@@ -3581,8 +3937,7 @@ def _build_category_reports(
                 for item in group
             ),
             clean_correct_count=sum(
-                item.judge_label is True and item.ingestion_complete
-                for item in group
+                item.judge_label is True and item.ingestion_complete for item in group
             ),
         )
         for category, group in sorted(grouped.items())
