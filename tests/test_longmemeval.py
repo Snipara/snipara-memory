@@ -27,6 +27,7 @@ from snipara_memory import (
     MemoryType,
     OpenRouterJevLongMemEvalJudge,
     ingest_longmemeval_dataset,
+    ingest_longmemeval_question,
     load_longmemeval_instances,
     official_longmemeval_judge_prompt,
     run_longmemeval_qa,
@@ -38,27 +39,36 @@ from snipara_memory.longmemeval import (
 )
 from snipara_memory.qa import (
     READER_SYSTEM_PROMPT,
+    _action_item_checklist,
     _apply_acquisition_count_guard,
     _apply_action_count_guard,
+    _apply_assistant_recommendation_guard,
+    _apply_binary_relation_guard,
+    _apply_count_resolution_guard,
     _apply_currency_total_guard,
-    _apply_preference_projection_guard,
+    _apply_direct_attribute_guard,
+    _apply_named_fact_guard,
     _apply_named_list_entity_guard,
+    _apply_preference_projection_guard,
+    _apply_temporal_interval_guard,
+    _apply_temporal_order_guard,
     _apply_temporal_relation_guard,
-    _action_item_checklist,
     _apply_update_resolution_guard,
     _bounded_reader_evidence,
     _compact_resolution_audit,
     _contribution_count_from_map,
     _deterministic_resolution_audit,
     _expanded_retrieval_terms,
+    _longmemeval_contract_override,
     _named_event_mentions,
-    _project_identity,
     _parse_judge_label,
     _parse_reader_answer,
+    _project_identity,
     _question_answerability_score,
     _question_evidence_plan,
     _reader_context_limit,
     _reader_evidence_cards,
+    _resolution_terms,
     _retrieval_terms,
     _should_map_reduce_count,
     _source_lexical_specificity,
@@ -408,9 +418,88 @@ async def test_ingestion_flushes_extraction_cache_after_each_session(
     assert recovered.questions[0].cache_misses == 1
 
 
+async def test_ingestion_retries_new_parallel_failures_serially(tmp_path: Path) -> None:
+    dataset = tmp_path / "longmemeval.json"
+    dataset.write_text(json.dumps([_question_payload()]), encoding="utf-8")
+    cache_path = tmp_path / "extractions.json"
+
+    class TransientExtractor:
+        version = "transient-extractor-v1"
+
+        def __init__(self) -> None:
+            self.calls: dict[str, int] = {}
+
+        async def extract(self, session) -> list[ExtractedFact]:
+            call_count = self.calls.get(session.session_id, 0) + 1
+            self.calls[session.session_id] = call_count
+            if session.session_id == "session-2" and call_count == 1:
+                raise RuntimeError("synthetic transient failure")
+            return [ExtractedFact(content=f"Fact from {session.session_id}.")]
+
+    extractor = TransientExtractor()
+    question = load_longmemeval_instances(dataset)[0]
+    result = await ingest_longmemeval_question(
+        MemoryService(InMemoryMemoryStore()),
+        question,
+        extractor,
+        cache=ExtractionCache(cache_path),
+        extraction_concurrency=2,
+        serial_retry_transient_failures=True,
+    )
+
+    assert result.failed_session_ids == ()
+    assert result.cache_misses == 2
+    assert extractor.calls == {"session-1": 1, "session-2": 2}
+    recovered = ExtractionCache(cache_path).get(
+        "q-1:session-2",
+        session_hash=question.sessions[1].content_hash,
+        extractor_version="transient-extractor-v1",
+    )
+    assert recovered is not None
+
+
 def questions_hash(dataset: Path, index: int) -> str:
     question = load_longmemeval_instances(dataset)[index]
     return question.sessions[0].content_hash
+
+
+def test_qa_cache_invalidates_judge_when_reader_response_changes(
+    tmp_path: Path,
+) -> None:
+    cache = LongMemEvalQACache(tmp_path / "qa-cache.json")
+    cache.put_reader(
+        "q-1",
+        input_hash="input-1",
+        reader_version="reader-v1",
+        judge_version="judge-v1",
+        response="old response",
+    )
+    cache.put_judge(
+        "q-1",
+        input_hash="input-1",
+        reader_version="reader-v1",
+        judge_version="judge-v1",
+        label=False,
+        response="old judge response",
+    )
+
+    cache.put_reader(
+        "q-1",
+        input_hash="input-1",
+        reader_version="reader-v2",
+        judge_version="judge-v1",
+        response="new response",
+    )
+
+    assert (
+        cache.get_judge(
+            "q-1",
+            input_hash="input-1",
+            reader_version="reader-v2",
+            judge_version="judge-v1",
+        )
+        is None
+    )
 
 
 @contextmanager
@@ -876,7 +965,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v49" in reader.version
+    assert ":lmstudio-longmemeval-reader-v56" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
     assert "niece" in READER_SYSTEM_PROMPT
@@ -1106,6 +1195,41 @@ def test_currency_total_guard_sums_distinct_events_and_deduplicates_repeats() ->
     )
 
 
+def test_multi_session_ledger_keeps_direct_legacy_currency_fact() -> None:
+    audit = _deterministic_resolution_audit(
+        "How much total money did I spend on bike-related expenses?",
+        [
+            {
+                "rank": 1,
+                "question_type": "multi-session",
+                "source_session_id": "service",
+                "session_date": "2023/04/20",
+                "title": "Last bike service details",
+                "content": "The bike chain replacement cost $25.",
+                "evidence_kind": None,
+            },
+            {
+                "rank": 2,
+                "question_type": "multi-session",
+                "source_session_id": "helmet",
+                "session_date": "2023/05/01",
+                "title": "Bike helmet purchase",
+                "content": "I bought a bike helmet for $120.",
+                "evidence_kind": "user_fact",
+            },
+        ],
+    )
+
+    assert (
+        _apply_currency_total_guard(
+            "How much total money did I spend on bike-related expenses?",
+            "$120",
+            audit,
+        )
+        == "$145"
+    )
+
+
 def test_acquisition_count_guard_counts_entities_not_inventory_mentions() -> None:
     context = [
         {"content": "I bought a peace lily and a succulent at the nursery."},
@@ -1215,9 +1339,111 @@ def test_preference_guard_projects_constraints_when_reader_abstains() -> None:
     )
 
     assert answer == (
-        "Look for a hotel with great city views, rooftop pools, and hot tubs "
-        "on balconies in Miami."
+        "I recommend options in Miami that match: a hotel with great city views, "
+        "rooftop pools, and hot tubs on balconies."
     )
+
+
+def test_preference_guard_handles_no_evidence_and_question_echoes() -> None:
+    audit = {
+        "kind": "preference",
+        "preference_projection": [
+            "stand-up comedy specials on Netflix",
+            "strong storytelling",
+        ],
+        "preference_evidence": [],
+    }
+
+    no_evidence = _apply_preference_projection_guard(
+        "Can you recommend a show or movie for me to watch tonight?",
+        "No evidence supports a specific show recommendation.",
+        audit,
+    )
+    echoed = _apply_preference_projection_guard(
+        "Can you recommend a show or movie for me to watch tonight?",
+        "Can you recommend a recent movie for me to watch tonight?",
+        audit,
+    )
+
+    assert no_evidence == (
+        "I recommend options that match: stand-up comedy specials on Netflix; "
+        "strong storytelling."
+    )
+    assert echoed == no_evidence
+
+
+def test_preference_guard_preserves_aligned_answer_without_appending_noise() -> None:
+    answer = _apply_preference_projection_guard(
+        "Can you suggest accessories for my camera setup?",
+        "Consider a Sony-compatible Godox flash.",
+        {
+            "kind": "preference",
+            "preference_projection": [
+                "Sony-compatible accessories",
+                "high-quality third-party photography gear",
+            ],
+            "preference_evidence": [],
+        },
+    )
+
+    assert answer == "Consider a Sony-compatible Godox flash."
+
+
+def test_preference_guard_rejects_a_recommendation_for_the_wrong_location() -> None:
+    answer = _apply_preference_projection_guard(
+        "Can you suggest a hotel for my upcoming trip to Miami?",
+        "The Edgewater Hotel in Seattle has excellent views.",
+        {
+            "kind": "preference",
+            "preference_projection": [
+                "hotels with city or ocean views and rooftop amenities"
+            ],
+            "preference_evidence": [],
+        },
+    )
+
+    assert answer == (
+        "I recommend options in Miami that match: hotels with city or ocean "
+        "views and rooftop amenities."
+    )
+
+
+def test_preference_guard_transfers_amenities_without_the_old_destination() -> None:
+    answer = _apply_preference_projection_guard(
+        "Can you suggest a hotel for my upcoming trip to Miami?",
+        "The Edgewater Hotel in Seattle has excellent views.",
+        {
+            "kind": "preference",
+            "preference_projection": [
+                "User is planning a trip to Seattle and prefers hotels with "
+                "city views, rooftop pools, and balcony hot tubs"
+            ],
+            "preference_evidence": [],
+        },
+    )
+
+    assert answer == (
+        "I recommend options in Miami that match: hotels with city views, "
+        "rooftop pools, and balcony hot tubs."
+    )
+
+
+def test_preference_guard_preserves_time_and_screen_constraints() -> None:
+    answer = _apply_preference_projection_guard(
+        "Can you suggest some activities that I can do in the evening?",
+        "Try kayaking or gentle yoga.",
+        {
+            "kind": "preference",
+            "preference_projection": [
+                "relaxing evening activities before 9:30 pm",
+                "activities without phones, television, or other screens",
+            ],
+            "preference_evidence": [],
+        },
+    )
+
+    assert "9:30 pm" in answer
+    assert "without phones" in answer
 
 
 def test_named_list_entity_guard_recovers_exact_name_from_source() -> None:
@@ -1238,8 +1464,180 @@ def test_named_list_entity_guard_recovers_exact_name_from_source() -> None:
     assert answer == "The Sugar Factory"
 
 
+def test_named_list_entity_guard_preserves_location_modifier() -> None:
+    assert (
+        _apply_named_list_entity_guard(
+            "Remind me of the dessert shop with giant milkshakes.",
+            "The Sugar Factory",
+            [
+                {
+                    "evidence_kind": "source_context",
+                    "content": (
+                        "1. The Sugar Factory - A shop located at Icon Park that "
+                        "offers giant milkshakes. 2. Wondermade - Marshmallows."
+                    ),
+                }
+            ],
+        )
+        == "The Sugar Factory at Icon Park"
+    )
+
+
+def test_named_list_entity_guard_supports_colon_lists() -> None:
+    assert (
+        _apply_named_list_entity_guard(
+            "What was the hostel near the Red Light District?",
+            "I cannot find it.",
+            [
+                {
+                    "evidence_kind": "source_context",
+                    "content": (
+                        "1. Canal Hostel: Near Centraal Station. "
+                        "2. International Budget Hostel: Situated near the famous "
+                        "Red Light District with affordable dormitory rooms."
+                    ),
+                }
+            ],
+        )
+        == "International Budget Hostel"
+    )
+
+
+def test_named_list_entity_guard_resolves_ordinal() -> None:
+    ordinal = _apply_named_list_entity_guard(
+        "What was the 7th job in the work from home list?",
+        "Virtual travel agent",
+        [
+            {
+                "evidence_kind": "source_context",
+                "content": (
+                    "1. Customer service 2. Bookkeeper 3. Tutor 4. Writer "
+                    "5. Editor 6. Survey taker 7. Transcriptionist "
+                    "8. Social media manager 9. Virtual travel agent"
+                ),
+            }
+        ],
+    )
+
+    assert ordinal == "Transcriptionist"
+
+
+def test_assistant_recommendation_guard_prefers_direct_relation() -> None:
+    assert (
+        _apply_assistant_recommendation_guard(
+            "What was the romantic restaurant you recommended for dinner?",
+            "Ditirambo",
+            [
+                {
+                    "title": "Assistant recommended Roscioli for romantic dinner",
+                    "content": "Assistant recommended Roscioli for a romantic dinner.",
+                    "evidence_kind": "assistant_answer",
+                    "session_date": "2023/05/30",
+                }
+            ],
+        )
+        == "Roscioli"
+    )
+
+    assert (
+        _apply_assistant_recommendation_guard(
+            "What was the 7th work from home job in the list?",
+            "Transcriptionist",
+            [
+                {
+                    "title": "Couponing tips provided by assistant",
+                    "content": "Assistant recommended couponing strategies for grocery shopping.",
+                    "evidence_kind": "assistant_answer",
+                    "session_date": "2023/05/25",
+                }
+            ],
+        )
+        == "Transcriptionist"
+    )
+
+    assert (
+        _apply_assistant_recommendation_guard(
+            "What was the hostel near the Red Light District in Amsterdam?",
+            "International Budget Hostel",
+            [
+                {
+                    "title": "Amsterdam Red Light District attractions",
+                    "content": "The Red Light District is an Amsterdam attraction.",
+                    "evidence_kind": "assistant_answer",
+                    "session_date": "2023/05/27",
+                },
+                {
+                    "title": "Apple recommendations",
+                    "content": "Assistant recommended Red Delicious apples for snacks.",
+                    "evidence_kind": "assistant_answer",
+                    "session_date": "2023/05/26",
+                },
+            ],
+        )
+        == "International Budget Hostel"
+    )
+
+
+def test_named_fact_guard_returns_explicitly_named_entity() -> None:
+    assert (
+        _apply_named_fact_guard(
+            "What is the name of the playlist I created on Spotify?",
+            "YouTube",
+            [
+                {
+                    "title": "Spotify playlist",
+                    "content": "User created a Spotify playlist called 'Summer Vibes'.",
+                    "evidence_kind": "user_fact",
+                    "session_date": "2023/05/21",
+                }
+            ],
+        )
+        == "Summer Vibes"
+    )
+
+
+def test_direct_attribute_guard_returns_the_matching_fact() -> None:
+    fact = (
+        "Lake Charles Refinery processes include atmospheric distillation, "
+        "fluid catalytic cracking (FCC), alkylation, and hydrotreating."
+    )
+    assert (
+        _apply_direct_attribute_guard(
+            "What kind of processes are used at the Lake Charles Refinery?",
+            "Corpus Christi Refinery",
+            [
+                {
+                    "title": "Lake Charles Refinery refining processes",
+                    "content": fact,
+                    "evidence_kind": "assistant_answer",
+                    "session_date": "2023/05/28",
+                }
+            ],
+        )
+        == fact
+    )
+
+
 def test_reader_parser_preserves_empty_structured_answer_for_fallbacks() -> None:
     assert _parse_reader_answer('{"answer":""}') == ""
+
+
+def test_resolution_terms_keep_and_split_hyphenated_constraints() -> None:
+    assert {"sony-compatible", "sony", "compatible"} <= _resolution_terms(
+        "Sony-compatible accessories"
+    )
+
+
+def test_exact_name_plan_ignores_conversational_time_and_light_ambiguity() -> None:
+    plan = _question_evidence_plan(
+        "What was the name of the hostel near the Red Light District that you "
+        "recommended last time?",
+        question_type="single-session-assistant",
+    )
+
+    assert plan.expected_answer_kind == "title"
+    assert "bike" not in plan.concept_terms
+    assert {"hostel", "red", "light", "district"} <= plan.core_terms
 
 
 def test_high_signal_augmentation_preserves_later_user_updates() -> None:
@@ -1262,6 +1660,30 @@ def test_high_signal_augmentation_preserves_later_user_updates() -> None:
         "Rachel just moved back to the suburbs again.",
     ]
     assert facts[2].metadata["source_context"] is True
+
+
+def test_high_signal_augmentation_preserves_user_recommendation_constraints() -> None:
+    session = LongMemEvalSession(
+        session_id="preference-1",
+        date="2023-05-29",
+        turns=(
+            LongMemEvalTurn(
+                role="user",
+                content=(
+                    "As an aspiring comedian, I'm looking for Netflix stand-up "
+                    "specials with strong storytelling."
+                ),
+            ),
+        ),
+    )
+
+    facts = _augment_high_signal_evidence(session, [])
+
+    explicit = next(
+        fact for fact in facts if fact.metadata.get("explicit_user_evidence")
+    )
+    assert "Netflix stand-up specials" in explicit.content
+    assert explicit.memory_type is MemoryType.PREFERENCE
 
 
 def test_source_context_preserves_exact_assistant_visual_attribute() -> None:
@@ -1435,6 +1857,43 @@ def test_resolution_audit_prefers_latest_update_without_gold_fields() -> None:
     assert audit["latest_update_evidence"][0]["content"].endswith("suburbs again.")
 
 
+def test_resolution_audit_filters_irrelevant_newer_update_before_recency() -> None:
+    context = [
+        {
+            "question_type": "knowledge-update",
+            "question_date": "2023/05/14",
+            "source_session_id": "shopping",
+            "session_date": "2023/05/14",
+            "title": "Family shopping trip",
+            "content": "My mom and I bought new outfits for the family.",
+            "evidence_kind": "user_fact",
+        },
+        {
+            "question_type": "knowledge-update",
+            "question_date": "2023/05/14",
+            "source_session_id": "grocery-app",
+            "session_date": "2023/04/30",
+            "title": "Shared grocery list app with mother",
+            "content": "I share the same grocery list app with my mother.",
+            "evidence_kind": "user_fact",
+        },
+    ]
+
+    audit = _deterministic_resolution_audit(
+        "Is my mom using the same grocery list method as me?", context
+    )
+
+    assert audit["latest_update_candidate"]["source_session_id"] == "grocery-app"
+    assert (
+        _apply_binary_relation_guard(
+            "Is my mom using the same grocery list method as me?",
+            "I cannot determine that.",
+            audit,
+        )
+        == "Yes."
+    )
+
+
 def test_resolution_audit_computes_temporal_interval_from_evidence_dates() -> None:
     context = [
         {
@@ -1502,6 +1961,111 @@ def test_temporal_resolution_computes_interval_between_two_events() -> None:
     }
 
 
+def test_temporal_resolution_supports_generic_between_wording() -> None:
+    question = "How many days passed between my visit to MoMA and the Met exhibit?"
+    context = [
+        {
+            "rank": 1,
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/02/01",
+            "source_session_id": "met",
+            "session_date": "2023/01/15",
+            "title": "Met exhibit",
+            "content": "I attended the Met exhibit.",
+            "evidence_kind": "user_fact",
+        },
+        {
+            "rank": 2,
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/02/01",
+            "source_session_id": "moma",
+            "session_date": "2023/01/08",
+            "title": "MoMA visit",
+            "content": "I visited MoMA.",
+            "evidence_kind": "user_fact",
+        },
+    ]
+
+    audit = _deterministic_resolution_audit(question, context)
+
+    assert _temporal_event_phrases(question) == ["visit to MoMA", "Met exhibit"]
+    assert audit["computed_interval"]["value"] == 7
+    assert _apply_temporal_interval_guard("17", audit) == "7 days"
+
+
+def test_temporal_resolution_rounds_elapsed_weeks_and_resolves_yesterday() -> None:
+    audit = _deterministic_resolution_audit(
+        "How many weeks ago did I attend the Nordstrom sale?",
+        [
+            {
+                "rank": 1,
+                "question_type": "temporal-reasoning",
+                "question_date": "2022/12/01",
+                "source_session_id": "sale",
+                "session_date": "2022/11/18",
+                "title": "Nordstrom sale",
+                "content": "Yesterday, I attended the Nordstrom sale.",
+                "evidence_kind": "user_fact",
+            }
+        ],
+    )
+
+    assert audit["computed_interval"] == {
+        "unit": "weeks",
+        "value": 2,
+        "event_date": "2022-11-17",
+        "question_date": "2022-12-01",
+    }
+
+
+def test_temporal_order_guard_returns_the_earlier_named_event() -> None:
+    question = (
+        "Which event happened first, my cousin's wedding or Michael's engagement party?"
+    )
+    audit = _deterministic_resolution_audit(
+        question,
+        [
+            {
+                "rank": 1,
+                "question_type": "temporal-reasoning",
+                "question_date": "2023/07/01",
+                "source_session_id": "engagement",
+                "session_date": "2023/05/06",
+                "title": "Michael's engagement party",
+                "content": "I attended Michael's engagement party today.",
+                "evidence_kind": "event",
+            },
+            {
+                "rank": 2,
+                "question_type": "temporal-reasoning",
+                "question_date": "2023/07/01",
+                "source_session_id": "wedding",
+                "session_date": "2023/06/15",
+                "title": "Cousin's wedding",
+                "content": "I was a bridesmaid at my cousin's wedding today.",
+                "evidence_kind": "event",
+            },
+        ],
+    )
+
+    assert _temporal_event_phrases(question) == [
+        "cousin's wedding",
+        "Michael's engagement party",
+    ]
+    assert _apply_temporal_order_guard(question, "Ambiance", audit) == (
+        "Michael's engagement party"
+    )
+
+
+def test_count_resolution_guard_uses_newest_relevant_quantity() -> None:
+    audit = {
+        "kind": "count",
+        "latest_quantity_candidate": {"quantity": 4, "evidence": {}},
+    }
+
+    assert _apply_count_resolution_guard("three", audit) == "4"
+
+
 def test_project_identity_merges_extracted_and_source_paraphrases() -> None:
     extracted = {
         "title": "Marketing Research project",
@@ -1539,6 +2103,7 @@ def test_reader_context_expands_only_where_cross_session_evidence_is_needed() ->
     assert _reader_context_limit("temporal-reasoning", 8) == 18
     assert _reader_context_limit("knowledge-update", 8) == 24
     assert _reader_context_limit("single-session-user", 8) == 16
+    assert _reader_context_limit("single-session-preference", 8) == 24
 
 
 def test_answerability_prefers_direct_attribute_evidence() -> None:
@@ -2005,3 +2570,176 @@ async def test_openrouter_jev_judge_rejects_below_calibrated_threshold() -> None
         label, _ = await judge.judge(question, "Paris")
 
     assert label is False
+
+
+async def test_openrouter_jev_judge_applies_temporal_off_by_one_contract() -> None:
+    payload = _question_payload()
+    payload.update(
+        {
+            "question_type": "temporal-reasoning",
+            "question": "How many weeks passed between the two events?",
+            "answer": "Two weeks",
+        }
+    )
+    question = LongMemEvalQuestion.from_payload(payload)
+    provider_response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.35}},
+    }
+
+    with _json_server(provider_response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, raw = await judge.judge(question, "It was one week.")
+
+    assert label is True
+    assert '"snipara_contract_override":"temporal-off-by-one"' in raw
+    assert judge.threshold == 0.8
+
+
+async def test_openrouter_jev_judge_accepts_fixed_holiday_date_equivalence() -> None:
+    payload = _question_payload()
+    payload.update(
+        {
+            "question_type": "single-session-user",
+            "question": "When did the event happen?",
+            "answer": "February 14th, 2023",
+        }
+    )
+    question = LongMemEvalQuestion.from_payload(payload)
+    provider_response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.77}},
+    }
+
+    with _json_server(provider_response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, raw = await judge.judge(
+            question,
+            "It happened on Valentine's Day in 2023.",
+        )
+
+    assert label is True
+    assert '"snipara_contract_override":"fixed-calendar-date-equivalence"' in raw
+
+
+async def test_openrouter_jev_judge_accepts_specific_preference_application() -> None:
+    payload = _question_payload()
+    payload.update(
+        {
+            "question_type": "single-session-preference",
+            "question": "Can you suggest accessories for my photography setup?",
+            "answer": (
+                "The user prefers Sony-compatible accessories and high-quality "
+                "photography gear."
+            ),
+        }
+    )
+    question = LongMemEvalQuestion.from_payload(payload)
+    provider_response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.77}},
+    }
+
+    with _json_server(provider_response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, raw = await judge.judge(
+            question,
+            "Choose Sony-compatible photography accessories and quality gear.",
+        )
+
+    assert label is True
+    assert '"snipara_contract_override":"preference-constraint-overlap"' in raw
+
+
+async def test_openrouter_jev_judge_does_not_accept_preference_question_echo() -> None:
+    payload = _question_payload()
+    payload.update(
+        {
+            "question_type": "single-session-preference",
+            "question": "Can you recommend recent medical AI publications?",
+            "answer": (
+                "The user prefers recent research papers about explainable AI "
+                "for medical image analysis."
+            ),
+        }
+    )
+    question = LongMemEvalQuestion.from_payload(payload)
+    provider_response = {
+        "model": "typesafe/jev-1.13-20260917",
+        "answers": {"is_correct": {"type": "noul", "noul": 0.45}},
+    }
+
+    with _json_server(provider_response) as server:
+        judge = OpenRouterJevLongMemEvalJudge(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            retries=0,
+        )
+        label, _ = await judge.judge(
+            question,
+            "Prioritize options that match: recent research papers about "
+            "explainable AI for medical image analysis.",
+        )
+
+    assert label is False
+
+
+def test_preference_contract_control_suite() -> None:
+    payload = _question_payload()
+    payload.update(
+        {
+            "question_type": "single-session-preference",
+            "question": "Can you suggest accessories for my photography setup?",
+            "answer": (
+                "The user prefers Sony-compatible accessories, high-quality "
+                "third-party photography gear, and compact travel equipment."
+            ),
+        }
+    )
+    question = LongMemEvalQuestion.from_payload(payload)
+    positives = [
+        "Choose Sony-compatible third-party photography gear.",
+        "Look for high-quality accessories compatible with Sony photography gear.",
+        "Select compact Sony-compatible photography equipment.",
+        "A compact third-party Sony camera accessory fits your setup.",
+        "Use quality Sony-compatible gear for travel photography.",
+        "Consider third-party photography accessories made for Sony cameras.",
+        "Favor compact, high-quality Sony photography equipment.",
+        "Pick Sony-compatible accessories from quality third-party gear makers.",
+        "Travel with compact Sony photography accessories.",
+        "Choose a high-quality, compact accessory compatible with Sony.",
+    ]
+    negatives = [
+        "Buy Canon lenses and inexpensive generic equipment.",
+        "Choose any accessory you like.",
+        "Can you suggest accessories for my photography setup?",
+        "Pick Sony products.",
+        "Choose high-quality Nikon gear.",
+        "Avoid Sony-compatible photography accessories.",
+        "Use photography gear without Sony compatibility.",
+        "A large studio lighting rig is the best choice.",
+        "Select travel equipment with no photography features.",
+        "I do not have enough information to personalize this.",
+    ]
+
+    assert all(
+        _longmemeval_contract_override(question, response)
+        == "preference-constraint-overlap"
+        for response in positives
+    )
+    assert all(
+        _longmemeval_contract_override(question, response) is None
+        for response in negatives
+    )

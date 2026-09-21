@@ -539,6 +539,7 @@ _EXPLICIT_USER_EVIDENCE_PATTERNS = (
     r"\b(?:lead|led|leading|team lead|project lead)\b",
     r"\b(?:nursery|baby shower|customized phone case|birthday)",
     r"\b(?:prefer|preference|interested in)",
+    r"\b(?:looking for|seeking|want to|would like|love to)",
     r"\b(?:spent|cost|paid|expense|expenses|price|priced)",
     r"\b(?:drove|driving|drive|bed|sleep|slept)",
     r"\b(?:doctor|physician|specialist|dermatologist|ent)\b",
@@ -1865,6 +1866,7 @@ async def ingest_longmemeval_question(
     namespace_id: str | None = None,
     extraction_concurrency: int = 1,
     retry_failed: bool = False,
+    serial_retry_transient_failures: bool = False,
 ) -> LongMemEvalIngestionResult:
     """Extract and store one question's sessions as structured memories."""
 
@@ -1884,6 +1886,8 @@ async def ingest_longmemeval_question(
     async def extract_session(
         index: int,
         session: LongMemEvalSession,
+        *,
+        bypass_cached_failure: bool = False,
     ) -> tuple[int, str, list[ExtractedFact], str | None]:
         cache_key = f"{question.question_id}:{session.session_id}"
         facts = None
@@ -1904,7 +1908,11 @@ async def ingest_longmemeval_question(
             if cache
             else None
         )
-        if cached_failure is not None and not retry_failed:
+        if (
+            cached_failure is not None
+            and not retry_failed
+            and not bypass_cached_failure
+        ):
             return (
                 index,
                 "cached-failure",
@@ -1967,6 +1975,21 @@ async def ingest_longmemeval_question(
             for index, session in enumerate(question.sessions)
         )
     )
+    if serial_retry_transient_failures:
+        recovered_sessions: list[tuple[int, str, list[ExtractedFact], str | None]] = []
+        for result in extracted_sessions:
+            index, status, _, _ = result
+            if status != "failed":
+                recovered_sessions.append(result)
+                continue
+            recovered_sessions.append(
+                await extract_session(
+                    index,
+                    question.sessions[index],
+                    bypass_cached_failure=True,
+                )
+            )
+        extracted_sessions = recovered_sessions
 
     for index, status, facts, failure_message in sorted(
         extracted_sessions, key=lambda result: result[0]
