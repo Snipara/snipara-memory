@@ -247,6 +247,52 @@ async def test_explicit_supersession_uses_observed_time_when_import_arrives_late
     assert buried.superseded_by_id == current.id
 
 
+async def test_bulk_supersession_chain_replaces_each_record_only_once() -> None:
+    store = InMemoryMemoryStore()
+    service = MemoryService(store=store)
+    created = await service.store_memories_bulk(
+        [
+            StoreMemoryRequest(
+                namespace_id="demo",
+                content=content,
+                memory_key=key,
+                supersedes_memory_key=replaces,
+                observed_at=datetime(2026, 8, day, tzinfo=UTC),
+            )
+            for day, content, key, replaces in [
+                (1, "The user plans a cucumber infusion.", "infusion.cucumber", None),
+                (
+                    2,
+                    "The user plans a melon infusion.",
+                    "infusion.melon",
+                    "infusion.cucumber",
+                ),
+                (
+                    3,
+                    "The user pairs melon with citrus.",
+                    "infusion.pairing",
+                    "infusion.melon",
+                ),
+                (
+                    4,
+                    "The user revised the melon plan.",
+                    "infusion.melon.v2",
+                    "infusion.melon",
+                ),
+            ]
+        ]
+    )
+
+    current = await store.list_memories("demo", statuses=[MemoryStatus.ACTIVE])
+    assert [memory.id for memory in current] == [created[-1].id]
+    for older in created[:-1]:
+        buried = await store.get_memory(older.id)
+        assert buried is not None
+        assert buried.status is MemoryStatus.GRAVEYARD
+        assert buried.buried_reason is GraveyardReason.SUPERSEDED
+    assert (await store.get_memory(created[2].id)).superseded_by_id == created[3].id
+
+
 async def test_contradiction_newer_resolution_uses_observed_time() -> None:
     service = MemoryService(store=InMemoryMemoryStore())
 

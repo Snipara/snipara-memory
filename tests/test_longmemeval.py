@@ -33,26 +33,84 @@ from snipara_memory import (
     run_longmemeval_qa,
 )
 from snipara_memory.longmemeval import (
+    _LmStudioRequestError,
     _augment_high_signal_evidence,
     _facts_from_lm_studio_batch_response,
     _facts_from_lm_studio_response,
 )
+
+
+def test_extractor_recovers_failed_chunk_without_losing_turn_indices() -> None:
+    class BoundedExtractor(LmStudioFactExtractor):
+        async def _post_json_async(self, payload):
+            session = json.loads(payload["messages"][1]["content"])
+            turns = session["turns"]
+            if sum(len(turn["content"]) for turn in turns) > 12:
+                if failure_mode == "context":
+                    raise _LmStudioRequestError("HTTP 400: context overflow")
+                return {"choices": [{"message": {"content": '{"facts":[{"content":'}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "facts": [
+                                        {
+                                            "content": turn["content"],
+                                            "memory_type": "FACT",
+                                            "source_turn_indices": [index],
+                                        }
+                                        for index, turn in enumerate(turns)
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    session = LongMemEvalSession(
+        session_id="split-test",
+        date="2024-01-01",
+        turns=(
+            LongMemEvalTurn(role="user", content="first turn"),
+            LongMemEvalTurn(role="assistant", content="second turn"),
+            LongMemEvalTurn(role="user", content="third turn"),
+        ),
+    )
+    for failure_mode in ("context", "invalid_json"):
+        extractor = BoundedExtractor(model="test", retries=0)
+        facts = asyncio.run(extractor.extract(session))
+        assert [fact.source_turn_indices for fact in facts] == [(0,), (1,), (2,)]
+        assert [fact.content for fact in facts] == [
+            "first turn",
+            "second turn",
+            "third turn",
+        ]
+
+
 from snipara_memory.qa import (
     READER_SYSTEM_PROMPT,
     _action_item_checklist,
     _apply_acquisition_count_guard,
     _apply_action_count_guard,
+    _apply_assistant_language_guard,
     _apply_assistant_recommendation_guard,
     _apply_binary_relation_guard,
     _apply_count_resolution_guard,
     _apply_currency_total_guard,
+    _apply_device_battery_guard,
     _apply_direct_attribute_guard,
+    _apply_direct_object_guard,
+    _apply_multi_session_count_guard,
     _apply_named_fact_guard,
     _apply_named_list_entity_guard,
     _apply_preference_projection_guard,
     _apply_temporal_interval_guard,
     _apply_temporal_order_guard,
     _apply_temporal_relation_guard,
+    _apply_temporal_trip_order_guard,
     _apply_update_resolution_guard,
     _bounded_reader_evidence,
     _compact_resolution_audit,
@@ -965,7 +1023,7 @@ def test_official_judge_prompt_uses_task_specific_rules() -> None:
 def test_reader_prompt_counts_action_records_across_venues() -> None:
     reader = LmStudioLongMemEvalReader(model="local-test-model")
 
-    assert ":lmstudio-longmemeval-reader-v56" in reader.version
+    assert ":lmstudio-longmemeval-reader-v59" in reader.version
     assert "dry-cleaning pickup" in READER_SYSTEM_PROMPT
     assert "silently enumerate" in READER_SYSTEM_PROMPT
     assert "niece" in READER_SYSTEM_PROMPT
@@ -1921,6 +1979,60 @@ def test_resolution_audit_computes_temporal_interval_from_evidence_dates() -> No
     }
 
 
+def test_temporal_days_ago_matches_action_synonyms_with_the_named_object() -> None:
+    cases = [
+        (
+            "How many days ago did I buy a smoker?",
+            "User purchased a smoker on March 15.",
+            "2023/03/15",
+            "2023/03/25",
+            "buy a smoker",
+            10,
+        ),
+        (
+            "How many days ago did I meet Emma?",
+            "User met Emma for lunch today.",
+            "2023/04/11",
+            "2023/04/20",
+            "meet Emma",
+            9,
+        ),
+    ]
+    for question, content, session_date, question_date, phrase, days in cases:
+        context = [
+            {
+                "question_type": "temporal-reasoning",
+                "question_date": question_date,
+                "source_session_id": "evidence",
+                "session_date": session_date,
+                "title": "User event",
+                "content": content,
+                "evidence_kind": "user_fact",
+            }
+        ]
+        assert _temporal_event_phrases(question) == [phrase]
+        audit = _deterministic_resolution_audit(question, context)
+        assert audit["computed_interval"]["value"] == days
+
+
+def test_temporal_total_does_not_use_time_since_one_event() -> None:
+    context = [
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/04/30",
+            "source_session_id": "reading",
+            "session_date": "2023/03/01",
+            "title": "Books read",
+            "content": "User spent two weeks reading a book and four weeks listening to another.",
+            "evidence_kind": "user_fact",
+        }
+    ]
+    audit = _deterministic_resolution_audit(
+        "How many weeks in total did I spend on the two books?", context
+    )
+    assert audit["computed_interval"] is None
+
+
 def test_temporal_resolution_computes_interval_between_two_events() -> None:
     question = (
         "How many days passed between the day I played my old keyboard "
@@ -2100,7 +2212,7 @@ def test_update_resolution_guard_rejects_conflicting_scalar() -> None:
 
 def test_reader_context_expands_only_where_cross_session_evidence_is_needed() -> None:
     assert _reader_context_limit("multi-session", 8) == 24
-    assert _reader_context_limit("temporal-reasoning", 8) == 18
+    assert _reader_context_limit("temporal-reasoning", 8) == 24
     assert _reader_context_limit("knowledge-update", 8) == 24
     assert _reader_context_limit("single-session-user", 8) == 16
     assert _reader_context_limit("single-session-preference", 8) == 24
@@ -2742,4 +2854,461 @@ def test_preference_contract_control_suite() -> None:
     assert all(
         _longmemeval_contract_override(question, response) is None
         for response in negatives
+    )
+
+
+def test_culinary_and_device_concepts_do_not_route_generic_ingredients_to_cocktails() -> (
+    None
+):
+    assert "cocktail" not in _expanded_retrieval_terms({"ingredient"})
+    garden = _expanded_retrieval_terms({"homegrown", "dinner"})
+    assert {"tomato", "basil", "mint"} <= garden
+    baking = _expanded_retrieval_terms({"cookies"})
+    assert {"sugar", "turbinado", "baking"} <= baking
+    battery = _expanded_retrieval_terms({"battery"})
+    assert {"power", "bank", "charging"} <= battery
+    slow_cooker = _expanded_retrieval_terms({"cooker"})
+    assert {"stew", "yogurt", "slow"} <= slow_cooker
+
+
+def test_temporal_first_batch_does_not_override_computed_interval_as_ordering() -> None:
+    question = (
+        "How many days passed between the day I started watering my herb garden "
+        "and the day I harvested my first batch of fresh herbs?"
+    )
+    context = [
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/04/20",
+            "source_session_id": "start",
+            "session_date": "2023/03/22",
+            "title": "Started watering herb garden",
+            "content": "User started watering the herb garden on 2023/03/22.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2023/03/22",
+        },
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/04/20",
+            "source_session_id": "harvest",
+            "session_date": "2023/04/15",
+            "title": "Harvested first batch of fresh herbs",
+            "content": "User harvested the first batch of fresh herbs on 2023/04/15.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2023/04/15",
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    interval = _apply_temporal_interval_guard("wrong", audit)
+    assert interval == "24 days"
+    assert _apply_temporal_order_guard(question, interval, audit) == "24 days"
+
+
+def test_temporal_since_when_computes_interval_between_events() -> None:
+    question = (
+        "How many days had passed since I finished reading The Seven Husbands "
+        "of Evelyn Hugo when I attended the book reading event at the library?"
+    )
+    context = [
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/02/10",
+            "source_session_id": "reading",
+            "session_date": "2022/12/28",
+            "title": "Finished Evelyn Hugo",
+            "content": "User finished reading The Seven Husbands of Evelyn Hugo today.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2022/12/28",
+        },
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/02/10",
+            "source_session_id": "event",
+            "session_date": "2023/01/15",
+            "title": "Book reading event",
+            "content": "User attended the book reading event at the local library today.",
+            "evidence_kind": "event",
+            "temporal_anchor": "2023/01/15",
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    assert _temporal_event_phrases(question) == [
+        "I finished reading The Seven Husbands of Evelyn Hugo",
+        "I attended the book reading event at the library",
+    ]
+    assert _apply_temporal_interval_guard("wrong", audit) == "18 days"
+
+
+def test_temporal_days_ago_when_uses_the_second_event_as_endpoint() -> None:
+    question = (
+        "How many days ago did I attend a baking class at a local culinary school "
+        "when I made my friend's birthday cake?"
+    )
+    context = [
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2022/04/15",
+            "source_session_id": "class",
+            "session_date": "2022/03/21",
+            "title": "Baking class",
+            "content": "User attended a baking class at a local culinary school yesterday.",
+            "evidence_kind": "event",
+            "temporal_anchor": "yesterday",
+        },
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2022/04/15",
+            "source_session_id": "cake",
+            "session_date": "2022/04/10",
+            "title": "Friend birthday cake",
+            "content": "User made a chocolate cake for a friend's birthday today.",
+            "evidence_kind": "event",
+            "temporal_anchor": "today",
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    assert _apply_temporal_interval_guard("wrong", audit) == "21 days"
+
+
+def test_knowledge_update_count_returns_initial_and_current_values() -> None:
+    question = (
+        "How many engineers do I lead when I just started my new role as Senior "
+        "Software Engineer? How many engineers do I lead now?"
+    )
+    context = [
+        {
+            "question_type": "knowledge-update",
+            "question_date": "2023/11/01",
+            "source_session_id": "initial",
+            "session_date": "2023/05/11",
+            "title": "Initial team size",
+            "content": "User leads a team of 4 engineers in the new Senior Software Engineer role.",
+            "evidence_kind": "user_fact",
+        },
+        {
+            "question_type": "knowledge-update",
+            "question_date": "2023/11/01",
+            "source_session_id": "current",
+            "session_date": "2023/10/24",
+            "title": "Current team size",
+            "content": "User is now leading a team of five engineers as Senior Software Engineer.",
+            "evidence_kind": "user_fact",
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    assert audit["kind"] == "knowledge_update"
+    assert _apply_update_resolution_guard("3", audit) == "4 initially; 5 now"
+
+
+def test_multi_session_count_guard_deduplicates_hours_by_session() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "contribution_ledger": [
+            {
+                "source_session_id": "a",
+                "content": "Played a game",
+                "scalar_values": ["25 hours"],
+            },
+            {
+                "source_session_id": "a",
+                "content": "Finished the same game",
+                "scalar_values": ["25 hours"],
+            },
+            {
+                "source_session_id": "b",
+                "content": "Played another game",
+                "scalar_values": ["30 hours"],
+            },
+            {
+                "source_session_id": "c",
+                "content": "Spent time playing a game",
+                "scalar_values": ["70 hours"],
+            },
+            {
+                "source_session_id": "d",
+                "content": "Completed a game",
+                "scalar_values": ["10 hours"],
+            },
+            {
+                "source_session_id": "e",
+                "content": "Finished a game",
+                "scalar_values": ["5 hours"],
+            },
+        ],
+    }
+    assert (
+        _apply_multi_session_count_guard(
+            "How many hours have I spent playing games in total?", "145 hours", audit
+        )
+        == "140 hours"
+    )
+
+
+def test_multi_session_count_guard_counts_distinct_film_festivals() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "contribution_ledger": [
+            {"source_session_id": "a", "named_events": ["Austin Film Festival"]},
+            {
+                "source_session_id": "a",
+                "named_events": ["Seattle International Film Festival"],
+            },
+            {"source_session_id": "b", "named_events": ["AFI Fest"]},
+            {"source_session_id": "b", "named_events": ["AFI Fest"]},
+            {"source_session_id": "c", "named_events": ["Portland Film Festival"]},
+            {"source_session_id": "x", "named_events": ["Tech Expo"]},
+        ],
+    }
+    assert (
+        _apply_multi_session_count_guard(
+            "How many movie festivals did I attend?", "3", audit
+        )
+        == "4"
+    )
+
+
+def test_named_list_guard_returns_all_requested_alternatives() -> None:
+    source = (
+        "assistant: Here are alternatives: 1. Sexual fixations - description. "
+        "2. Problematic sexual behaviors - description. 3. Sexual impulsivity - description. "
+        "4. Compulsive sexuality - description."
+    )
+    answer = _apply_named_list_entity_guard(
+        "Can you remind me what the other four options were?",
+        "Sexual fixations",
+        [{"evidence_kind": "source_context", "content": source}],
+    )
+    assert answer == (
+        "Sexual fixations, Problematic sexual behaviors, Sexual impulsivity, "
+        "Compulsive sexuality"
+    )
+
+
+def test_assistant_language_guard_uses_the_explicit_recommended_list() -> None:
+    answer = _apply_assistant_language_guard(
+        "Which back-end programming languages did you recommend I learn?",
+        "Python, Ruby, Java, Node.js",
+        [
+            {
+                "title": "Full-stack tips",
+                "content": "Learn a back-end programming language, such as Ruby, Python, or PHP.",
+                "evidence_kind": "source_context",
+            }
+        ],
+    )
+    assert answer == "Ruby, Python, PHP"
+
+
+def test_assistant_recommendation_guard_recovers_recommended_trail_name() -> None:
+    answer = _apply_assistant_recommendation_guard(
+        "What was the name of the hiking trail you recommended through Moncayo?",
+        "Roxborough State Park",
+        [
+            {
+                "title": "Recommended hiking trail in Moncayo Natural Park",
+                "content": "The GR-90 is a recommended circular hiking trail in Moncayo Natural Park.",
+                "evidence_kind": "assistant_answer",
+            }
+        ],
+    )
+    assert answer == "GR-90"
+
+
+def test_direct_object_guard_recovers_sisters_birthday_gift() -> None:
+    answer = _apply_direct_object_guard(
+        "What did I buy for my sister's birthday gift?",
+        "Occasions",
+        [
+            {
+                "title": "Gift for sister's birthday",
+                "content": "User bought sister a yellow dress and matching pair of earrings for her birthday.",
+                "fact_key": "user.sister_gift",
+                "evidence_kind": "user_fact",
+            }
+        ],
+    )
+    assert answer == "yellow dress"
+
+
+def test_temporal_trip_duration_uses_relevant_start_and_end_dates() -> None:
+    question = (
+        "How many days did I spend on my solo camping trip to Yosemite National Park?"
+    )
+    context = [
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/05/20",
+            "source_session_id": "start",
+            "session_date": "2023/05/15",
+            "title": "Solo camping trip to Yosemite",
+            "content": "User started a solo camping trip to Yosemite National Park today.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2023/05/15",
+        },
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/05/20",
+            "source_session_id": "end",
+            "session_date": "2023/05/17",
+            "title": "Recent Yosemite camping trip",
+            "content": "User completed the solo camping trip to Yosemite National Park today.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2023/05/17",
+        },
+        {
+            "question_type": "temporal-reasoning",
+            "question_date": "2023/05/20",
+            "source_session_id": "noise",
+            "session_date": "2023/05/09",
+            "title": "Unrelated trip",
+            "content": "User discussed a business trip to London.",
+            "evidence_kind": "user_fact",
+            "temporal_anchor": "2023/05/09",
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    assert _apply_temporal_interval_guard("15 days", audit) == "2 days"
+
+
+def test_knowledge_update_prefers_latest_assistant_answer() -> None:
+    question = "How many stars do I need to reach the gold level on Starbucks Rewards?"
+    context = [
+        {
+            "question_type": "knowledge-update",
+            "source_session_id": "old",
+            "session_date": "2023/07/11",
+            "title": "Old Gold requirement",
+            "content": "Gold status requires 125 stars within 12 months.",
+            "evidence_kind": "assistant_answer",
+        },
+        {
+            "question_type": "knowledge-update",
+            "source_session_id": "new",
+            "session_date": "2023/07/30",
+            "title": "Current Gold requirement",
+            "content": "To reach Gold level, you need 120 stars within 12 months.",
+            "evidence_kind": "assistant_answer",
+        },
+        {
+            "question_type": "knowledge-update",
+            "source_session_id": "new",
+            "session_date": "2023/07/30",
+            "title": "Referral promotion",
+            "content": "A referral promotion awards 200 stars.",
+            "evidence_kind": "source_context",
+            "source_roles": ["assistant", "user"],
+        },
+    ]
+    audit = _deterministic_resolution_audit(question, context)
+    assert audit["latest_update_candidate"]["content"].startswith("To reach Gold")
+    assert "120 stars" in _apply_update_resolution_guard("125", audit)
+
+
+def test_multi_session_count_guard_counts_attended_wedding_sessions() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "contribution_ledger": [
+            {
+                "source_session_id": "rachel",
+                "content": "I've been to a few weddings recently, including Rachel's wedding.",
+            },
+            {
+                "source_session_id": "emily",
+                "content": "User planned 50 guests like their college roommate's wedding.",
+            },
+            {
+                "source_session_id": "jen",
+                "content": "User was inspired by a rustic barn wedding they attended for Jen and Tom.",
+            },
+            {
+                "source_session_id": "noise",
+                "content": "User is planning their own wedding.",
+            },
+        ],
+    }
+    assert (
+        _apply_multi_session_count_guard(
+            "How many weddings have I attended this year?", "1", audit
+        )
+        == "3 weddings"
+    )
+
+
+def test_luxury_concept_expansion_covers_common_purchase_entities() -> None:
+    expanded = _expanded_retrieval_terms({"luxury", "item"})
+    assert {"designer", "handbag", "gown", "boots", "splurge"} <= expanded
+
+
+def test_device_battery_guard_uses_owned_power_bank() -> None:
+    audit = {
+        "kind": "preference",
+        "preference_evidence": [
+            {"content": "User owns a portable power bank and wireless charging pad."}
+        ],
+    }
+    answer = _apply_device_battery_guard(
+        "I've been having trouble with the battery life on my phone lately. Any tips?",
+        "Try replacing the battery.",
+        audit,
+    )
+    assert "portable power bank fully charged" in answer
+    assert "battery-saving mode" in answer
+
+
+def test_temporal_trip_order_guard_orders_distinct_trip_types() -> None:
+    question = (
+        "What is the order of the three trips I took in the past three months, "
+        "from earliest to latest?"
+    )
+    context = [
+        {
+            "source_session_id": "muir",
+            "session_date": "2023/03/10",
+            "content": "I just got back from a day hike to Muir Woods National Monument with my family today.",
+            "evidence_kind": "user_fact",
+        },
+        {
+            "source_session_id": "big-sur",
+            "session_date": "2023/04/20",
+            "content": "User recently returned from a road trip with friends to Big Sur and Monterey on 2023/04/20.",
+            "evidence_kind": "user_fact",
+        },
+        {
+            "source_session_id": "yosemite",
+            "session_date": "2023/05/15",
+            "content": "I started my solo camping trip to Yosemite National Park today.",
+            "evidence_kind": "user_fact",
+        },
+    ]
+    answer = _apply_temporal_trip_order_guard(question, "1 month", context)
+    assert answer == (
+        "day hike to Muir Woods National Monument with my family; then "
+        "road trip with friends to Big Sur and Monterey; then "
+        "solo camping trip to Yosemite National Park"
+    )
+
+
+def test_multi_session_wedding_guard_lists_available_couples() -> None:
+    audit = {
+        "kind": "multi_session_count",
+        "contribution_ledger": [
+            {
+                "source_session_id": "rachel",
+                "content": "User attended cousin Rachel's vineyard wedding.",
+            },
+            {
+                "source_session_id": "emily",
+                "content": "User was inspired by friend Emily's wedding to Sarah.",
+            },
+            {
+                "source_session_id": "jen",
+                "content": "User was inspired by a wedding they attended for friend Jen and Tom.",
+            },
+        ],
+    }
+    answer = _apply_multi_session_count_guard(
+        "How many weddings have I attended this year?", "1", audit
+    )
+    assert answer == (
+        "3 weddings: Rachel's wedding; Emily and Sarah's wedding; Jen and Tom's wedding"
     )

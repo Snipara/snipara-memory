@@ -1088,8 +1088,11 @@ class LmStudioFactExtractor:
             for session, facts in zip(sessions, recovered, strict=True)
         }
 
-    async def _extract_chunk(self, session: LongMemEvalSession) -> list[ExtractedFact]:
+    async def _extract_chunk(
+        self, session: LongMemEvalSession, *, split_depth: int = 0
+    ) -> list[ExtractedFact]:
         payload = self._build_payload(session)
+        last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
                 request_payload = (
@@ -1100,20 +1103,86 @@ class LmStudioFactExtractor:
                 response = await self._post_json_async(request_payload)
                 return _facts_from_lm_studio_response(response)
             except _LmStudioRequestError as error:
+                last_error = error
                 if attempt >= self.retries:
-                    raise RuntimeError(
-                        f"LM Studio request failed after {attempt + 1} attempts: {error}"
-                    ) from error
+                    break
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
             except ValueError as error:
+                last_error = error
                 if attempt >= self.retries:
-                    raise ValueError(
-                        "LM Studio returned invalid structured facts after "
-                        f"{attempt + 1} attempts: {error}"
-                    ) from error
+                    break
                 await asyncio.sleep(min(2**attempt, 8))
-        raise AssertionError("LM Studio retry loop exited unexpectedly")
+        # A shorter input bounds both the response size and the context budget.
+        # Preserve the source turn indices when a failed chunk is split.
+        if split_depth < 4:
+            halves = self._split_failed_chunk(session)
+            if halves is not None:
+                recovered: list[ExtractedFact] = []
+                for half, indices in halves:
+                    for fact in await self._extract_chunk(
+                        half, split_depth=split_depth + 1
+                    ):
+                        recovered.append(
+                            replace(
+                                fact,
+                                source_turn_indices=tuple(
+                                    indices[index]
+                                    for index in fact.source_turn_indices
+                                    if 0 <= index < len(indices)
+                                ),
+                            )
+                        )
+                return recovered
+        if isinstance(last_error, _LmStudioRequestError):
+            raise RuntimeError(
+                f"LM Studio request failed after {self.retries + 1} attempts: {last_error}"
+            ) from last_error
+        raise ValueError(
+            "LM Studio returned invalid structured facts after "
+            f"{self.retries + 1} attempts: {last_error}"
+        ) from last_error
+
+    @staticmethod
+    def _split_failed_chunk(
+        session: LongMemEvalSession,
+    ) -> list[tuple[LongMemEvalSession, tuple[int, ...]]] | None:
+        turns = session.turns
+        if len(turns) > 1:
+            total = sum(len(turn.content) for turn in turns)
+            running = 0
+            split_at = 1
+            for index, turn in enumerate(turns[:-1], 1):
+                running += len(turn.content)
+                split_at = index
+                if running >= total / 2:
+                    break
+            return [
+                (replace(session, turns=turns[:split_at]), tuple(range(split_at))),
+                (
+                    replace(session, turns=turns[split_at:]),
+                    tuple(range(split_at, len(turns))),
+                ),
+            ]
+        if not turns or len(turns[0].content) < 2:
+            return None
+        midpoint = len(turns[0].content) // 2
+        return [
+            (
+                replace(
+                    session,
+                    turns=(replace(turns[0], content=turns[0].content[:midpoint]),),
+                ),
+                (0,),
+            ),
+            (
+                replace(
+                    session,
+                    turns=(replace(turns[0], content=turns[0].content[midpoint:]),),
+                ),
+                (0,),
+            ),
+        ]
 
     def _session_chunks(
         self, session: LongMemEvalSession

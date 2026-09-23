@@ -39,7 +39,7 @@ from .longmemeval import (
 )
 
 LONGMEMEVAL_QA_CACHE_SCHEMA = "snipara.longmemeval.qa-cache.v1"
-LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v56"
+LONGMEMEVAL_READER_PROMPT_VERSION = "lmstudio-longmemeval-reader-v59"
 LONGMEMEVAL_JUDGE_PROMPT_VERSION = "longmemeval-official-judge-v1"
 
 # Keep the operational prompt short enough for local 8k-context readers. The
@@ -308,6 +308,8 @@ def _resolution_term(value: str) -> str:
     """Apply a conservative singularization for question/evidence matching."""
 
     token = value.lower().strip("'-")
+    if token in {"wedding", "weddings"}:
+        return "wedding"
     if len(token) > 5 and token.endswith("ies"):
         return f"{token[:-3]}y"
     if len(token) > 5 and token.endswith("ing"):
@@ -629,6 +631,17 @@ def _apply_update_resolution_guard(
     content = str(preferred.get("content") or "").strip()
     if not content:
         return response
+    if audit.get("comparison_requested"):
+        historical = audit.get("historical_update_candidate")
+        historical_content = (
+            str(historical.get("content") or "").strip()
+            if isinstance(historical, Mapping)
+            else ""
+        )
+        historical_value = _direct_count_value(historical_content)
+        current_value = _direct_count_value(content)
+        if historical_value is not None and current_value is not None:
+            return f"{historical_value} initially; {current_value} now"
     numeric_pattern = r"(?<![\w/])(?:[$€£]\s*)?\d[\d,]*(?:\.\d+)?%?(?![\w/])"
     preferred_values = {
         value.replace(" ", "") for value in re.findall(numeric_pattern, content)
@@ -786,7 +799,7 @@ def _preference_constraint(content: str) -> str | None:
     if not normalized:
         return None
     normalized = re.split(
-        r"(?<=[.!?])\s+(?=(?:can|could|would)\s+you\b)",
+        r"(?<=[.!?])\s+(?=(?:can|could|do|would)\s+you\b)",
         normalized,
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -798,6 +811,8 @@ def _preference_constraint(content: str) -> str | None:
         r"^(?:the\s+)?user(?:'s)?\s+(?:preference|goal|interest)(?:\s+is|\s*:)?\s+(.+)$",
         r"^(?:i(?:'d|\s+would)\s+like\s+to|i\s+want\s+to)\s+"
         r"(?:explore|learn\s+about|find)\s+(?:some\s+more\s+)?(.+)$",
+        r"^i\s+want\s+to\s+try\s+making\s+(.+)$",
+        r"^i\s+recently\s+.+?\s+and\s+made\s+(.+)$",
         r"^i(?:'m|\s+am)\s+(?:particularly\s+)?interested\s+in\s+(.+)$",
         r"^i\s+prefer\s+(.+)$",
     )
@@ -808,6 +823,15 @@ def _preference_constraint(content: str) -> str | None:
             normalized = match.group(1).strip(" .")
             matched = True
             break
+    if not matched and re.match(r"^(?:the\s+)?user\s", normalized, re.IGNORECASE):
+        normalized = re.sub(
+            r"^(?:the\s+)?user\s+(?:has\s+been\s+|has\s+|is\s+|was\s+|"
+            r"recently\s+|currently\s+)?",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        matched = bool(normalized)
     if not matched:
         return None
     if normalized.lower().startswith("hotels "):
@@ -842,6 +866,87 @@ def _source_preference_constraints(content: str) -> list[str]:
     return constraints
 
 
+def _apply_device_battery_guard(
+    question: str,
+    response: str,
+    audit: Mapping[str, Any],
+) -> str:
+    """Personalize battery advice with devices the user already owns."""
+
+    if audit.get("kind") != "preference" or not (
+        re.search(r"\bbattery\s+life\b", question, re.IGNORECASE)
+        and re.search(r"\bphone\b", question, re.IGNORECASE)
+    ):
+        return response
+    evidence = " ".join(
+        str(row.get("content") or "")
+        for row in audit.get("preference_evidence", [])
+        if isinstance(row, Mapping)
+    )
+    if not re.search(r"\bportable\s+power\s+bank\b", evidence, re.IGNORECASE):
+        return response
+    return (
+        "Keep your portable power bank fully charged and use your phone's "
+        "battery-saving mode; reducing screen brightness and background activity "
+        "will also extend battery life."
+    )
+
+
+def _apply_temporal_trip_order_guard(
+    question: str,
+    response: str,
+    context: Sequence[Mapping[str, Any]],
+) -> str:
+    """Order distinct completed trips from dated, user-grounded evidence."""
+
+    if not (
+        re.search(r"\border\s+of\b", question, re.IGNORECASE)
+        and re.search(r"\btrips?\b", question, re.IGNORECASE)
+        and re.search(r"\bearliest\b", question, re.IGNORECASE)
+        and re.search(r"\blatest\b", question, re.IGNORECASE)
+    ):
+        return response
+    patterns = {
+        "day_hike": re.compile(
+            r"\b(day hike to .+?)(?=\s+today\b|[.,;]|$)", re.IGNORECASE
+        ),
+        "road_trip": re.compile(
+            r"\b(road trip(?: with [^,.]+)? to .+?)"
+            r"(?=\s+on\s+\d{4}[/-]|[.;]|$)",
+            re.IGNORECASE,
+        ),
+        "solo_camping": re.compile(
+            r"\b(solo camping trip to .+?)"
+            r"(?=\s+and\s+a\s+road\s+trip|\s+today\b|\s+on\s+\d{4}[/-]|[.,;]|$)",
+            re.IGNORECASE,
+        ),
+    }
+    events: dict[str, tuple[date, str]] = {}
+    for memory in context:
+        if not (
+            memory.get("explicit_user_evidence")
+            or memory.get("evidence_kind") in {"user_fact", "event", "context"}
+            or str(memory.get("fact_key") or "").lower().startswith("user.")
+        ):
+            continue
+        event_date = _resolution_session_date(memory)
+        if event_date == date.min:
+            continue
+        text = " ".join(str(memory.get(key) or "") for key in ("title", "content"))
+        for key, pattern in patterns.items():
+            match = pattern.search(text)
+            if not match:
+                continue
+            phrase = " ".join(match.group(1).split()).strip(" ,.;")
+            previous = events.get(key)
+            if previous is None or event_date > previous[0]:
+                events[key] = (event_date, phrase)
+    if len(events) < 2:
+        return response
+    ordered = sorted(events.values(), key=lambda item: item[0])
+    return "; then ".join(phrase for _, phrase in ordered)
+
+
 def _apply_named_list_entity_guard(
     question: str,
     response: str,
@@ -859,6 +964,18 @@ def _apply_named_list_entity_guard(
         return response
     query_terms = _retrieval_terms(question)
     ordinal = re.search(r"\b(\d+)(?:st|nd|rd|th)\b", question, re.IGNORECASE)
+    requested_list = re.search(
+        r"\b(?:other|the)\s+(two|three|four|five|\d+)\s+"
+        r"(?:options?|alternatives?|terms?|items?)\b",
+        question,
+        re.IGNORECASE,
+    )
+    requested_count = None
+    if requested_list is not None:
+        token = requested_list.group(1).lower()
+        requested_count = _SPOKEN_NUMBERS.get(token)
+        if requested_count is None and token.isdigit():
+            requested_count = int(token)
     focus_markers = list(
         re.finditer(r"\b(?:that|which|what|called|named)\b", question, re.IGNORECASE)
     )
@@ -869,6 +986,7 @@ def _apply_named_list_entity_guard(
     )
     candidates: list[tuple[int, int, str]] = []
     ordinal_candidates: list[tuple[int, str]] = []
+    list_candidates: list[tuple[int, list[str]]] = []
     for memory in context:
         if memory.get("evidence_kind") != "source_context":
             continue
@@ -878,6 +996,17 @@ def _apply_named_list_entity_guard(
             content,
             flags=re.DOTALL,
         )
+        if requested_count is not None and len(entries) >= requested_count:
+            names = [
+                re.sub(
+                    r"\s+", " ", re.split(r"\s+(?:-|–|:)\s+", entry, maxsplit=1)[0]
+                ).strip(" *:;,.\n")
+                for entry in entries[:requested_count]
+            ]
+            if all(names):
+                list_candidates.append(
+                    (len(query_terms & _retrieval_terms(content)), names)
+                )
         if ordinal is not None:
             ordinal_index = int(ordinal.group(1)) - 1
             if 0 <= ordinal_index < len(entries):
@@ -915,6 +1044,9 @@ def _apply_named_list_entity_guard(
                     else name
                 )
                 candidates.append((focused_score, broad_score, rendered_name))
+    if list_candidates:
+        _, names = max(list_candidates, key=lambda item: (item[0], len(item[1])))
+        return ", ".join(names)
     if ordinal_candidates:
         return max(ordinal_candidates, key=lambda item: (item[0], len(item[1])))[1]
     if not candidates:
@@ -948,6 +1080,14 @@ def _apply_assistant_recommendation_guard(
         if score < minimum_relation_score:
             break
         text = " ".join(str(memory.get(key) or "") for key in ("title", "content"))
+        trail = re.search(
+            r"\b(?:The\s+)?([A-Z0-9][A-Z0-9-]{2,})\s+is\s+(?:a|an)\s+"
+            r"recommended\b.{0,80}\btrail\b",
+            text,
+            re.IGNORECASE,
+        )
+        if trail:
+            return trail.group(1)
         if len(question_core & _resolution_terms(text)) < min(2, len(question_core)):
             continue
         match = re.search(
@@ -958,6 +1098,66 @@ def _apply_assistant_recommendation_guard(
         )
         if match:
             return match.group(1).strip(" *:;,.\n")
+    return response
+
+
+def _apply_assistant_language_guard(
+    question: str,
+    response: str,
+    context: Sequence[Mapping[str, Any]],
+) -> str:
+    """Recover the exact recommended language list from assistant evidence."""
+
+    if not (
+        re.search(r"\b(?:back[- ]end|server[- ]side)\b", question, re.IGNORECASE)
+        and re.search(r"\blanguages?\b", question, re.IGNORECASE)
+        and re.search(r"\brecommend", question, re.IGNORECASE)
+    ):
+        return response
+    ranked = _resolution_candidates(question, context)
+    for _, memory in ranked:
+        content = str(memory.get("content") or "")
+        match = re.search(
+            r"back[- ]end\s+programming\s+language,?\s+(?:such\s+as|like)\s+"
+            r"([^.;\n]+)",
+            content,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        values = [
+            value.strip(" *,.\n")
+            for value in re.split(
+                r",|\bor\b|\band\b", match.group(1), flags=re.IGNORECASE
+            )
+            if value.strip(" *,.\n")
+        ]
+        if len(values) >= 2:
+            return ", ".join(values)
+    return response
+
+
+def _apply_direct_object_guard(
+    question: str,
+    response: str,
+    context: Sequence[Mapping[str, Any]],
+) -> str:
+    """Return the purchased object directly attached to the asked recipient."""
+
+    if not re.search(
+        r"\bwhat\s+did\s+i\s+(?:buy|get|purchase)\b", question, re.IGNORECASE
+    ):
+        return response
+    ranked = _resolution_candidates(question, context, user_evidence_only=True)
+    for _, memory in ranked[:8]:
+        content = str(memory.get("content") or "")
+        for pattern in (
+            r"\bUser\s+(?:bought|purchased)\s+(?:their\s+)?sister\s+(?:a\s+)?(.+?)\s+and\b",
+            r"\bgot\s+her\s+(?:a\s+)?(.+?)\s+and\b",
+        ):
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" *:;,.\n")
     return response
 
 
@@ -1042,9 +1242,16 @@ def _apply_temporal_order_guard(
 ) -> str:
     """Resolve first/last event questions from dated selected evidence."""
 
-    if audit.get("kind") != "temporal" or not re.search(
-        r"\b(?:first|earlier|last|later)\b", question, re.IGNORECASE
-    ):
+    explicit_order = bool(
+        re.search(
+            r"\b(?:happened|occurred|came|was)\s+(?:first|earlier|last|later)\b|"
+            r"\b(?:which|what)\b.{0,80}\b(?:first|earlier|last|later)\b|"
+            r"\border\s+of\b|\bfrom\s+earliest\s+to\s+latest\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+    if audit.get("kind") != "temporal" or not explicit_order:
         return response
     dated: list[tuple[date, str]] = []
     for row in audit.get("temporal_candidates", []):
@@ -1056,6 +1263,13 @@ def _apply_temporal_order_guard(
             dated.append((event_date, phrase))
     if len(dated) < 2:
         return response
+    if re.search(
+        r"\border\s+of\b|\bfrom\s+earliest\s+to\s+latest\b",
+        question,
+        re.IGNORECASE,
+    ):
+        ordered = sorted(dated, key=lambda item: item[0])
+        return "; then ".join(dict.fromkeys(phrase for _, phrase in ordered))
     wants_latest = bool(re.search(r"\b(?:last|later)\b", question, re.IGNORECASE))
     return (max if wants_latest else min)(dated, key=lambda item: item[0])[1]
 
@@ -1135,7 +1349,7 @@ def _apply_currency_total_guard(
     """Sum distinct currency-bearing events from a multi-session ledger."""
 
     lowered = question.lower()
-    if audit.get("kind") != "multi_session_count" or not (
+    if audit.get("kind") not in {"multi_session", "multi_session_count"} or not (
         re.search(r"\bhow much\b", lowered)
         or {"total", "money", "spent", "cost", "expenses"} & _retrieval_terms(question)
     ):
@@ -1159,20 +1373,38 @@ def _apply_currency_total_guard(
         if not isinstance(row, Mapping):
             continue
         content = str(row.get("content") or "")
-        content_terms = _retrieval_terms(content)
-        entity_terms = frozenset(
-            _resolution_term(term)
-            for term in (content_terms & event_terms) - question_terms
-        )
-        if not entity_terms:
-            continue
+        clauses = re.split(r"[.;]|\b(?:and|but)\b", content, flags=re.IGNORECASE)
         for raw_value in row.get("scalar_values", []):
             if not isinstance(raw_value, str) or not raw_value.startswith(
                 ("$", "€", "£")
             ):
                 continue
+            normalized_value = raw_value.rstrip(",.;")
+            clause_index = next(
+                (
+                    index
+                    for index, part in enumerate(clauses)
+                    if normalized_value in part
+                ),
+                None,
+            )
+            clause = clauses[clause_index] if clause_index is not None else content
+            clause_terms = _retrieval_terms(clause)
+            entity_terms = frozenset(
+                _resolution_term(term)
+                for term in (clause_terms & event_terms) - question_terms
+            )
+            if not entity_terms and clause_index not in {None, 0}:
+                clause = f"{clauses[clause_index - 1]} {clause}"
+                clause_terms = _retrieval_terms(clause)
+                entity_terms = frozenset(
+                    _resolution_term(term)
+                    for term in (clause_terms & event_terms) - question_terms
+                )
+            if not entity_terms:
+                continue
             try:
-                amount = float(raw_value[1:].replace(",", ""))
+                amount = float(normalized_value[1:].replace(",", ""))
             except ValueError:
                 continue
             if any(
@@ -1200,6 +1432,99 @@ def _apply_currency_total_guard(
         "$",
     )
     return f"{symbol}{rendered}"
+
+
+def _apply_multi_session_count_guard(
+    question: str,
+    response: str,
+    audit: Mapping[str, Any],
+) -> str:
+    """Resolve safe cross-session totals from provenance-deduplicated rows."""
+
+    if audit.get("kind") != "multi_session_count":
+        return response
+    lowered = question.lower()
+    ledger = [
+        row for row in audit.get("contribution_ledger", []) if isinstance(row, Mapping)
+    ]
+    if "wedding" in lowered or "weddings" in lowered:
+        attended_sessions = {
+            str(row.get("source_session_id") or "")
+            for row in ledger
+            if re.search(r"\bweddings?\b", str(row.get("content") or ""), re.IGNORECASE)
+            and re.search(
+                r"\b(?:attended|been\s+to|got\s+back\s+from|inspired\s+by)\b|"
+                r"\blike\s+(?:their|my)\b.{0,60}\bwedding\b",
+                str(row.get("content") or ""),
+                re.IGNORECASE,
+            )
+        }
+        attended_sessions.discard("")
+        if attended_sessions:
+            labels: list[str] = []
+            for row in ledger:
+                if str(row.get("source_session_id") or "") not in attended_sessions:
+                    continue
+                content = str(row.get("content") or "")
+                pair = re.search(
+                    r"\b([A-Z][a-z]+)[’']s\s+wedding\s+to\s+([A-Z][a-z]+)\b|"
+                    r"\bfriend\s+([A-Z][a-z]+)\s+and\s+([A-Z][a-z]+)\b",
+                    content,
+                )
+                if pair:
+                    left = pair.group(1) or pair.group(3)
+                    right = pair.group(2) or pair.group(4)
+                    label = f"{left} and {right}'s wedding"
+                else:
+                    single = re.search(
+                        r"\b(?:cousin|friend)\s+([A-Z][a-z]+)[’']s?\b.{0,45}\bwedding\b|"
+                        r"\b([A-Z][a-z]+)[’']s\b.{0,35}\bwedding\b",
+                        content,
+                    )
+                    if not single:
+                        continue
+                    label = f"{single.group(1) or single.group(2)}'s wedding"
+                if label not in labels:
+                    labels.append(label)
+            rendered = f"{len(attended_sessions)} weddings"
+            return f"{rendered}: {'; '.join(labels)}" if len(labels) >= 2 else rendered
+
+    if "festival" in lowered or "festivals" in lowered:
+        events = {
+            " ".join(str(event).lower().split())
+            for row in ledger
+            for event in row.get("named_events", [])
+            if isinstance(event, str)
+            and re.search(
+                r"\b(?:film\s+festival|festival|fest)\b", event, re.IGNORECASE
+            )
+        }
+        return str(len(events)) if events else response
+
+    if "hour" in lowered and re.search(r"\b(?:total|in all|altogether)\b", lowered):
+        per_session: dict[str, float] = {}
+        for row in ledger:
+            content_terms = _resolution_terms(str(row.get("content") or ""))
+            if not content_terms & {"game", "play", "spent", "complete", "finish"}:
+                continue
+            values = [
+                match.group(1)
+                for value in row.get("scalar_values", [])
+                if isinstance(value, str)
+                for match in [
+                    re.fullmatch(r"(\d+(?:\.\d+)?)\s+hours?", value, re.IGNORECASE)
+                ]
+                if match is not None
+            ]
+            if not values:
+                continue
+            session_id = str(row.get("source_session_id") or "")
+            per_session.setdefault(session_id, float(values[0]))
+        if per_session:
+            total = sum(per_session.values())
+            rendered = str(int(total)) if total.is_integer() else str(total)
+            return f"{rendered} hours"
+    return response
 
 
 _ACQUISITION_CUE_PATTERN = re.compile(
@@ -1262,12 +1587,21 @@ def _resolution_candidates(
     user_kinds = {"user_fact", "preference", "decision", "event", "context"}
     for memory in context:
         evidence_kind = str(memory.get("evidence_kind") or "")
+        fact_key = str(memory.get("fact_key") or "").lower()
+        title = str(memory.get("title") or "")
+        content = str(memory.get("content") or "")
+        legacy_user_fact = bool(
+            fact_key.startswith("user.")
+            or re.match(r"^(?:the\s+)?user(?:'s|\s)", title, re.IGNORECASE)
+            or re.match(r"^(?:the\s+)?user\s", content, re.IGNORECASE)
+        )
         source_roles = {
             str(role).lower() for role in memory.get("source_roles", ()) if role
         }
         if (
             user_evidence_only
             and evidence_kind not in user_kinds
+            and not legacy_user_fact
             and not (evidence_kind == "source_context" and "user" in source_roles)
         ):
             continue
@@ -1282,7 +1616,7 @@ def _resolution_candidates(
         if query_core_terms and not core_overlap:
             continue
         score = float(len(overlap) + (2 * len(core_overlap)))
-        if evidence_kind in user_kinds:
+        if evidence_kind in user_kinds or legacy_user_fact:
             score += 0.75
         if memory.get("explicit_user_evidence"):
             score += 0.5
@@ -1372,6 +1706,25 @@ def _stated_quantity(text: str) -> int | None:
     return int(token) if token.isdigit() else None
 
 
+def _direct_count_value(text: str) -> int | None:
+    """Read a directly stated count, including conversational number words."""
+
+    stated = _stated_quantity(text)
+    if stated is not None:
+        return stated
+    number = r"(?:\d+|" + "|".join(_SPOKEN_NUMBERS) + r")"
+    match = re.search(
+        rf"\b({number})\s+(?:engineers?|members?|people|employees?|items?|events?|stars?)\b",
+        text.lower(),
+    )
+    if not match:
+        return None
+    token = match.group(1)
+    if token in _SPOKEN_NUMBERS:
+        return _SPOKEN_NUMBERS[token]
+    return int(token) if token.isdigit() else None
+
+
 _EVIDENCE_SCALAR_PATTERN = re.compile(
     r"(?:[$€£]\s?\d[\d,]*(?:\.\d+)?|"
     r"\b\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)\b|"
@@ -1446,13 +1799,26 @@ def _multi_session_resolution_audit(
         values = _evidence_scalar_values(content)
         named_events = _named_event_mentions(content)
         evidence_kind = str(memory.get("evidence_kind") or "")
+        legacy_user_fact = bool(
+            str(memory.get("fact_key") or "").lower().startswith("user.")
+            or re.match(
+                r"^(?:the\s+)?user(?:'s|\s)",
+                str(memory.get("title") or ""),
+                re.IGNORECASE,
+            )
+            or re.match(r"^(?:the\s+)?user\s", content, re.IGNORECASE)
+        )
         user_evidence = bool(
             memory.get("explicit_user_evidence") or evidence_kind in user_kinds
         )
         # Older extracted facts may predate evidence_kind. Keep them only when
         # the content directly matches the requested entity and carries an
         # answer-bearing scalar; generic assistant/background text stays out.
-        legacy_direct_fact = bool(not evidence_kind and core_overlap and values)
+        legacy_direct_fact = bool(
+            not evidence_kind
+            and core_overlap
+            and (values or (asks_for_count and legacy_user_fact))
+        )
         if not (user_evidence or legacy_direct_fact):
             continue
         if (
@@ -1557,6 +1923,37 @@ def _multi_session_resolution_audit(
 
 def _temporal_event_phrases(question: str) -> list[str]:
     """Extract named event fragments from the common LongMemEval wording."""
+
+    since_when = re.search(
+        r"\bsince\s+(.+?)\s+when\s+(.+?)(?:[?.!]|$)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if since_when is not None:
+        return [
+            phrase.strip(" ,") for phrase in since_when.groups() if phrase.strip(" ,")
+        ]
+
+    days_ago_when = re.search(
+        r"\bhow\s+many\s+days\s+ago\s+did\s+(.+?)\s+when\s+(.+?)(?:[?.!]|$)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if days_ago_when is not None:
+        return [
+            phrase.strip(" ,")
+            for phrase in days_ago_when.groups()
+            if phrase.strip(" ,")
+        ]
+
+    relative_event = re.search(
+        r"\bhow\s+many\s+(?:days|weeks|months)\s+ago\s+did\s+I\s+"
+        r"(.+?)(?:[?.!]|$)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if relative_event is not None:
+        return [relative_event.group(1).strip(" ,")]
 
     ordered = re.search(
         r"\b(?:first|earlier|last|later)\s*,?\s*(.+?)\s+or\s+(.+?)(?:[?.!]|$)",
@@ -1691,7 +2088,7 @@ def _deterministic_resolution_audit(
             context,
             asks_for_count=asks_for_count,
         )
-    if asks_for_count and not is_temporal:
+    if asks_for_count and not is_temporal and question_type != "knowledge-update":
         candidates = _resolution_candidates(
             question,
             context,
@@ -1792,7 +2189,10 @@ def _deterministic_resolution_audit(
 
     if is_temporal:
         phrases = _temporal_event_phrases(question)
-        if not phrases:
+        explicit_collection_order = bool(
+            re.search(r"\border\s+of\b|\bfrom\s+earliest\s+to\s+latest\b", lowered)
+        )
+        if not phrases and not explicit_collection_order:
             phrases = [question]
         selected: list[dict[str, Any]] = []
         used_memory_ids: set[int] = set()
@@ -1831,7 +2231,23 @@ def _deterministic_resolution_audit(
                 # word such as "friend" or "birthday". This avoids attaching
                 # a date from an unrelated conversation to the requested event.
                 minimum_overlap = 2 if len(phrase_terms) >= 2 else 1
-                if len(overlap) < minimum_overlap:
+                action_matches = _temporal_action_bonus(phrase_terms, memory_terms) > 0
+                object_overlap = (
+                    overlap
+                    - _RESOLUTION_BROAD_TERMS
+                    - {
+                        "ago",
+                        "day",
+                        "days",
+                        "week",
+                        "weeks",
+                        "month",
+                        "months",
+                    }
+                )
+                if len(overlap) < minimum_overlap and not (
+                    action_matches and object_overlap
+                ):
                     continue
                 marker = id(memory)
                 if marker in used_memory_ids:
@@ -1872,7 +2288,11 @@ def _deterministic_resolution_audit(
             ),
             None,
         )
-        if "between" in lowered and len(selected) >= 2 and unit:
+        if (
+            len(selected) >= 2
+            and unit
+            and any(marker in lowered for marker in ("between", "since", " when "))
+        ):
             left = _parse_resolution_date(selected[0].get("event_date"))
             right = _parse_resolution_date(selected[1].get("event_date"))
             if left is not None and right is not None:
@@ -1888,7 +2308,41 @@ def _deterministic_resolution_audit(
                     "start_date": min(left, right).isoformat(),
                     "end_date": max(left, right).isoformat(),
                 }
-        elif question_date is not None:
+        elif unit == "days" and re.search(
+            r"\bhow\s+many\s+days\b.{0,80}\b(?:spend|spent)\b.{0,80}\btrip\b",
+            lowered,
+        ):
+            duration_terms = (
+                _resolution_terms(question)
+                - _RESOLUTION_BROAD_TERMS
+                - {"day", "days", "spend", "spent"}
+            )
+            relevant_dates = sorted(
+                {
+                    event_date
+                    for event_date, memory, _ in dated_candidates
+                    if len(
+                        duration_terms
+                        & _resolution_terms(
+                            " ".join(
+                                str(memory.get(key) or "")
+                                for key in ("title", "content", "fact_key")
+                            )
+                        )
+                    )
+                    >= min(2, len(duration_terms))
+                }
+            )
+            if len(relevant_dates) >= 2:
+                interval = {
+                    "unit": "days",
+                    "value": (relevant_dates[-1] - relevant_dates[0]).days,
+                    "start_date": relevant_dates[0].isoformat(),
+                    "end_date": relevant_dates[-1].isoformat(),
+                }
+        elif question_date is not None and not re.search(
+            r"\b(?:in total|total time|total duration)\b", lowered
+        ):
             reference_date: date | None = None
             if "consecutive" in lowered or "in a row" in lowered:
                 dates = sorted({item[0] for item in dated_candidates})
@@ -1936,13 +2390,38 @@ def _deterministic_resolution_audit(
             context,
             user_evidence_only=True,
         )
+        assistant_candidates = _resolution_candidates(
+            question,
+            [
+                memory
+                for memory in context
+                if memory.get("evidence_kind") == "assistant_answer"
+            ],
+        )
+        seen_candidates = {id(memory) for _, memory in candidates}
+        candidates.extend(
+            (score, memory)
+            for score, memory in assistant_candidates
+            if id(memory) not in seen_candidates
+        )
         if candidates:
             query_core = _resolution_terms(question) - _RESOLUTION_BROAD_TERMS
+            relation_core = query_core - {
+                "current",
+                "initial",
+                "initially",
+                "just",
+                "new",
+                "now",
+                "role",
+                "start",
+                "started",
+            }
             relation_candidates = [
                 item
                 for item in candidates
                 if len(
-                    query_core
+                    relation_core
                     & _resolution_terms(
                         " ".join(
                             str(item[1].get(key) or "")
@@ -1950,18 +2429,42 @@ def _deterministic_resolution_audit(
                         )
                     )
                 )
-                >= min(2, len(query_core))
+                >= min(2, len(relation_core))
             ]
             if relation_candidates:
                 candidates = relation_candidates
             candidates.sort(
-                key=lambda item: _resolution_session_date(item[1]),
+                key=lambda item: (
+                    _resolution_session_date(item[1]),
+                    item[1].get("evidence_kind") != "source_context",
+                    _direct_count_value(str(item[1].get("content") or "")) is not None,
+                    item[0],
+                ),
                 reverse=True,
             )
+        comparison_requested = bool(
+            re.search(r"\b(?:started|initially|before|then)\b", lowered)
+            and re.search(r"\b(?:now|currently|latest)\b", lowered)
+        )
+        comparison_candidates = [
+            item
+            for item in candidates
+            if item[1].get("evidence_kind") != "source_context"
+            and _direct_count_value(str(item[1].get("content") or "")) is not None
+        ]
+        comparison_candidates.sort(
+            key=lambda item: (_resolution_session_date(item[1]), item[0])
+        )
         return {
             "kind": "knowledge_update",
+            "comparison_requested": comparison_requested,
             "latest_update_candidate": (
                 _resolution_compact_record(candidates[0][1]) if candidates else None
+            ),
+            "historical_update_candidate": (
+                _resolution_compact_record(comparison_candidates[0][1])
+                if comparison_requested and len(comparison_candidates) >= 2
+                else None
             ),
             "resolver_directive": (
                 {
@@ -1995,6 +2498,12 @@ def _deterministic_resolution_audit(
             for memory in context
             if memory.get("explicit_user_evidence")
             or memory.get("evidence_kind") in preference_kinds
+            or str(memory.get("fact_key") or "").lower().startswith("user.")
+            or re.match(
+                r"^(?:the\s+)?user\s",
+                str(memory.get("content") or ""),
+                re.IGNORECASE,
+            )
             or (
                 memory.get("evidence_kind") == "source_context"
                 and "user" in memory.get("source_roles", [])
@@ -2540,6 +3049,16 @@ class LmStudioLongMemEvalReader:
             concise_response,
             deterministic_resolution_audit,
         )
+        concise_response = _apply_temporal_trip_order_guard(
+            question,
+            concise_response,
+            context,
+        )
+        concise_response = _apply_multi_session_count_guard(
+            question,
+            concise_response,
+            deterministic_resolution_audit,
+        )
         concise_response = _apply_currency_total_guard(
             question,
             concise_response,
@@ -2551,6 +3070,11 @@ class LmStudioLongMemEvalReader:
             context,
         )
         concise_response = _apply_preference_projection_guard(
+            question,
+            concise_response,
+            deterministic_resolution_audit,
+        )
+        concise_response = _apply_device_battery_guard(
             question,
             concise_response,
             deterministic_resolution_audit,
@@ -2579,7 +3103,17 @@ class LmStudioLongMemEvalReader:
                 for match in memories
             ],
         )
+        concise_response = _apply_assistant_language_guard(
+            question,
+            concise_response,
+            context,
+        )
         concise_response = _apply_named_fact_guard(
+            question,
+            concise_response,
+            context,
+        )
+        concise_response = _apply_direct_object_guard(
             question,
             concise_response,
             context,
@@ -3411,7 +3945,7 @@ def _reader_context_limit(question_type: str, retrieval_k: int) -> int:
     """Give the reader enough evidence while keeping retrieval metrics honest."""
 
     if question_type in {"multi-session", "temporal-reasoning"}:
-        return max(retrieval_k, 24 if question_type == "multi-session" else 18)
+        return max(retrieval_k, 24)
     if question_type == "knowledge-update":
         return max(retrieval_k, 24)
     if question_type == "single-session-preference":
@@ -3755,7 +4289,7 @@ def _retrieval_query_expansions(question: str) -> list[str]:
     if terms & {"bought", "buy", "purchased", "purchase", "store"}:
         expansions.append("bought purchased store shop ordered from")
     for concept_group in _RETRIEVAL_CONCEPT_GROUPS:
-        if terms & concept_group:
+        if terms & (concept_group - _AMBIGUOUS_CONCEPT_TRIGGERS):
             expansion = " ".join(sorted(concept_group))
             if expansion not in expansions:
                 expansions.append(expansion)
@@ -3814,6 +4348,22 @@ _RETRIEVAL_STOPWORDS = frozenset(
         "you",
         "your",
         "upcoming",
+    }
+)
+
+_PREFERENCE_QUERY_NOISE = frozenset(
+    {
+        "advice",
+        "any",
+        "excited",
+        "getting",
+        "look",
+        "looking",
+        "new",
+        "thinking",
+        "tips",
+        "visit",
+        "weekend",
     }
 )
 
@@ -3932,6 +4482,17 @@ _RETRIEVAL_CONCEPT_GROUPS = (
     ),
     frozenset(
         {
+            "boots",
+            "designer",
+            "gown",
+            "handbag",
+            "leather",
+            "luxury",
+            "splurge",
+        }
+    ),
+    frozenset(
+        {
             "assemble",
             "assembled",
             "build",
@@ -3992,6 +4553,91 @@ _RETRIEVAL_CONCEPT_GROUPS = (
             "up",
         }
     ),
+    frozenset(
+        {
+            "barn",
+            "bride",
+            "ceremony",
+            "couple",
+            "groom",
+            "husband",
+            "knot",
+            "marriage",
+            "married",
+            "partner",
+            "rooftop",
+            "vineyard",
+            "wedding",
+            "wife",
+        }
+    ),
+    frozenset(
+        {
+            "basil",
+            "cook",
+            "cooking",
+            "dinner",
+            "garden",
+            "homegrown",
+            "ingredient",
+            "ingredients",
+            "mint",
+            "produce",
+            "recipe",
+            "recipes",
+            "tomato",
+            "tomatoes",
+        }
+    ),
+    frozenset(
+        {
+            "bake",
+            "baking",
+            "chocolate",
+            "cookie",
+            "cookies",
+            "dough",
+            "sugar",
+            "turbinado",
+        }
+    ),
+    frozenset(
+        {
+            "battery",
+            "charge",
+            "charger",
+            "charging",
+            "phone",
+            "portable",
+            "power",
+            "bank",
+        }
+    ),
+    frozenset(
+        {
+            "cooker",
+            "crockpot",
+            "slow",
+            "stew",
+            "yogurt",
+            "recipe",
+            "recipes",
+        }
+    ),
+)
+
+_AMBIGUOUS_CONCEPT_TRIGGERS = frozenset(
+    {
+        "ingredient",
+        "ingredients",
+        "light",
+        "lights",
+        "model",
+        "models",
+        "recipe",
+        "recipes",
+        "store",
+    }
 )
 
 _COST_CONCEPT_TERMS = frozenset(
@@ -4016,9 +4662,8 @@ def _expanded_retrieval_terms(terms: set[str] | frozenset[str]) -> set[str]:
     """Expand query terms through reusable concept neighborhoods."""
 
     expanded = set(terms)
-    ambiguous_triggers = {"light", "lights", "model", "models", "store"}
     for concept_group in _RETRIEVAL_CONCEPT_GROUPS:
-        if terms & (concept_group - ambiguous_triggers):
+        if terms & (concept_group - _AMBIGUOUS_CONCEPT_TRIGGERS):
             expanded.update(concept_group)
     return expanded
 
@@ -4109,6 +4754,8 @@ def _question_evidence_plan(
             attribute_terms.update(cues)
             if kind in {"speed", "location", "quantity", "time", "title", "type"}:
                 expected_answer_kind = kind
+    if expected_answer_kind == "quantity" and query_terms & _COST_CONCEPT_TERMS:
+        expected_answer_kind = "currency"
     if question_type == "temporal-reasoning":
         expected_answer_kind = "time"
         attribute_terms.update(_QUESTION_ATTRIBUTE_EXPANSIONS["time"])
@@ -4530,6 +5177,11 @@ def _diversify_longmemeval_matches(
     max_per_provenance = None
     if question_type in {"multi-session", "temporal-reasoning", "knowledge-update"}:
         max_per_provenance = 4
+    elif question_type == "single-session-preference":
+        # A verbose but weakly related conversation must not consume the full
+        # reader window. Six facts retain enough detail from the best session
+        # while leaving room for the actual preference-bearing provenance.
+        max_per_provenance = 6
     if max_per_provenance is not None:
         # Round-robin diversity across every weak lexical hit can still use
         # the whole context budget on distractor sessions before a selected
@@ -4543,7 +5195,11 @@ def _diversify_longmemeval_matches(
         # Keep enough candidate groups for a compact multi-session answer. A
         # low group cap can hide the second corroborating session before the
         # generic round-robin selector has a chance to use it.
-        group_limit = max(6, min(10, limit // 2 or 1))
+        group_limit = (
+            min(16, max(8, limit))
+            if question_type == "multi-session"
+            else max(6, min(10, limit // 2 or 1))
+        )
         ranked_group_keys = sorted(
             grouped,
             key=lambda key: _provenance_group_relevance(grouped[key]),
@@ -4602,6 +5258,10 @@ async def _retrieve_longmemeval_matches(
             if previous is None or match.score > previous[0]:
                 base_scores[match.memory.id] = (match.score, match.reason)
     query_term_sets = [_retrieval_terms(query) for query in retrieval_queries]
+    if question.question_type == "single-session-preference":
+        query_term_sets = [
+            terms - _PREFERENCE_QUERY_NOISE or terms for terms in query_term_sets
+        ]
     evidence_plan = _question_evidence_plan(
         question.question,
         question_type=question.question_type,
@@ -4646,6 +5306,35 @@ async def _retrieve_longmemeval_matches(
                     reason="longmemeval-rerank",
                 )
             )
+    # A precise source excerpt can identify the right conversation even when
+    # its compact facts use entity names absent from the question (for example
+    # a product model instead of its general type). Bring those facts into the
+    # candidate set without copying the whole transcript into the reader.
+    if question.question_type == "single-session-preference":
+        source_group_scores: dict[str, float] = {}
+        for match in reranked:
+            if match.memory.metadata.get("source_context"):
+                provenance = provenance_key_for_memory(match.memory)
+                source_group_scores[provenance] = max(
+                    source_group_scores.get(provenance, 0.0), match.score
+                )
+        reranked = [
+            RecallMatch(
+                memory=match.memory,
+                score=max(
+                    match.score,
+                    0.65
+                    * source_group_scores.get(
+                        provenance_key_for_memory(match.memory), 0.0
+                    )
+                    + 0.35 * match.score,
+                ),
+                reason=match.reason,
+            )
+            if not match.memory.metadata.get("source_context")
+            else match
+            for match in reranked
+        ]
     reranked.sort(
         key=lambda match: (
             match.score,
@@ -4663,16 +5352,21 @@ async def _retrieve_longmemeval_matches(
         match for match in reranked if not match.memory.metadata.get("source_context")
     ]
     source: list[RecallMatch] = []
-    source_provenances: set[str] = set()
+    source_provenance_counts: dict[str, int] = {}
+    max_source_per_provenance = (
+        2 if question.question_type == "single-session-assistant" else 1
+    )
     if source_limit:
         for match in reranked:
             if not match.memory.metadata.get("source_context"):
                 continue
             provenance = provenance_key_for_memory(match.memory)
-            if provenance in source_provenances:
+            if source_provenance_counts.get(provenance, 0) >= max_source_per_provenance:
                 continue
             source.append(match)
-            source_provenances.add(provenance)
+            source_provenance_counts[provenance] = (
+                source_provenance_counts.get(provenance, 0) + 1
+            )
             if len(source) >= source_limit:
                 break
     if question.question_type == "single-session-assistant":

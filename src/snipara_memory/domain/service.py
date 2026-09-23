@@ -821,13 +821,20 @@ class MemoryService:
                 namespace_id,
                 statuses=[MemoryStatus.ACTIVE],
             )
+            # Bulk-created records are already visible in the store, but must
+            # enter this index in input order. Indexing them all up front can
+            # leave a key pointing at a record buried earlier in this loop.
+            created_ids = {memory.id for memory in created}
             current_by_key = {
-                memory.memory_key: memory for memory in active if memory.memory_key
+                memory.memory_key: memory
+                for memory in active
+                if memory.memory_key and memory.id not in created_ids
             }
             for memory in (
                 item for item in created if item.namespace_id == namespace_id
             ):
                 supersedes_key = memory.supersedes_memory_key
+                buried = False
                 if supersedes_key:
                     previous = current_by_key.get(supersedes_key)
                     if previous is not None and previous.id != memory.id:
@@ -844,6 +851,12 @@ class MemoryService:
                                 ),
                             )
                             superseded_ids.append(previous.id)
+                            # A replacement can be known through more than one
+                            # key in a chain. Redirect every alias so no later
+                            # update tries to bury the old record again.
+                            for key, current in list(current_by_key.items()):
+                                if current.id == previous.id:
+                                    current_by_key[key] = memory
                             current_by_key[supersedes_key] = memory
                         else:
                             # Imports can arrive out of order. Keep the latest
@@ -860,9 +873,10 @@ class MemoryService:
                                 ),
                             )
                             superseded_ids.append(memory.id)
+                            buried = True
                     else:
                         current_by_key[supersedes_key] = memory
-                if memory.memory_key:
+                if memory.memory_key and not buried:
                     current = current_by_key.get(memory.memory_key)
                     if current is None or self._observation_sort_key(
                         memory
