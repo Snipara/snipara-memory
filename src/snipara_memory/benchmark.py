@@ -176,6 +176,7 @@ async def run_longmemeval_qa(
     question_ids: set[str] | None = None,
     extraction_concurrency: int = 1,
     retry_failed: bool = False,
+    use_evidence_graph: bool = False,
 ) -> LongMemEvalQAReport:
     """Run retrieve -> reader -> official judge on a LongMemEval subset."""
 
@@ -191,6 +192,7 @@ async def run_longmemeval_qa(
         question_ids=question_ids,
         extraction_concurrency=extraction_concurrency,
         retry_failed=retry_failed,
+        use_evidence_graph=use_evidence_graph,
     )
 
 
