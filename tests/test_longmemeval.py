@@ -90,7 +90,7 @@ def test_extractor_recovers_failed_chunk_without_losing_turn_indices() -> None:
         ]
 
 
-from snipara_memory.qa import (
+from snipara_memory.qa import (  # noqa: E402
     READER_SYSTEM_PROMPT,
     _action_item_checklist,
     _apply_acquisition_count_guard,
