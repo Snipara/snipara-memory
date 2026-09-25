@@ -745,13 +745,13 @@ async def test_lm_studio_batch_extractor_chunks_and_remaps_turn_indices() -> Non
 def test_lm_studio_version_changes_when_model_or_prompt_changes() -> None:
     base = LmStudioFactExtractor(model="model-a")
 
-    assert base.version == "model-a:lmstudio-fact-extractor-v4"
+    assert base.version == "model-a:lmstudio-fact-extractor-v5"
     assert base.max_session_chars == 12000
     assert LmStudioFactExtractor(model="model-b").version != base.version
     assert (
-        LmStudioFactExtractor(
-            model="model-a", prompt_version="lmstudio-fact-extractor-v5"
-        ).version
+            LmStudioFactExtractor(
+                model="model-a", prompt_version="lmstudio-fact-extractor-v6"
+            ).version
         != base.version
     )
     assert (

@@ -25,6 +25,7 @@ from .benchmark import (
 )
 from .domain import MemoryService
 from .importers import import_project_documents, import_transcript
+from .holdout import freeze_longmemeval_holdout, validate_longmemeval_holdout
 from .longmemeval import (
     LM_STUDIO_DEFAULT_PROMPT_VERSION,
     HeuristicFactExtractor,
@@ -47,6 +48,7 @@ COMMANDS = {
     "benchmark",
     "longmemeval-ingest",
     "longmemeval-qa",
+    "longmemeval-holdout",
     "mcp",
     "version",
 }
@@ -104,6 +106,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument("dataset", help="Path to benchmark dataset (json/jsonl)")
     benchmark.add_argument("--json", action="store_true", help="Render JSON output")
+
+    holdout = subparsers.add_parser(
+        "longmemeval-holdout",
+        help="Freeze or validate a disjoint LongMemEval holdout manifest",
+    )
+    holdout.add_argument("dataset", help="Path to LongMemEval JSON/JSONL dataset")
+    holdout.add_argument("output", help="Manifest path to write")
+    holdout.add_argument(
+        "--per-category",
+        type=int,
+        required=True,
+        help="Number of questions to select per category",
+    )
+    holdout.add_argument(
+        "--exclude-manifest",
+        action="append",
+        default=[],
+        help="Existing manifest whose question IDs must be excluded",
+    )
+    holdout.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate the output manifest instead of creating it",
+    )
+    holdout.add_argument("--json", action="store_true", help="Render JSON output")
 
     longmemeval = subparsers.add_parser(
         "longmemeval-ingest",
@@ -208,6 +235,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--evidence-graph",
         action="store_true",
         help="Enable bounded evidence-graph expansion for retrieval ablations",
+    )
+    longmemeval_qa.add_argument(
+        "--evidence-reasoning",
+        action="store_true",
+        help="Add supported deterministic numeric evidence cards",
+    )
+    longmemeval_qa.add_argument(
+        "--evidence-abstention",
+        action="store_true",
+        help="Add bounded abstention cards for conflicting or insufficient numeric evidence",
     )
     longmemeval_qa.add_argument(
         "--extractor",
@@ -337,6 +374,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "benchmark":
         asyncio.run(_run_benchmark(args))
         return
+    if args.command == "longmemeval-holdout":
+        _run_longmemeval_holdout(args)
+        return
     if args.command == "longmemeval-ingest":
         asyncio.run(_run_longmemeval_ingest(args))
         return
@@ -380,6 +420,28 @@ def _build_service(args: argparse.Namespace) -> MemoryService:
 def _run_api(args: argparse.Namespace) -> None:
     app = create_app(_build_service(args))
     uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+
+
+def _run_longmemeval_holdout(args: argparse.Namespace) -> None:
+    if args.validate_only:
+        result = validate_longmemeval_holdout(
+            args.dataset,
+            args.output,
+            excluded_manifest_paths=tuple(args.exclude_manifest),
+        )
+    else:
+        excluded_ids = set()
+        for manifest_path in args.exclude_manifest:
+            with open(manifest_path, encoding="utf-8") as manifest_file:
+                payload = json.load(manifest_file)
+            excluded_ids.update(str(value) for value in payload.get("question_ids", []))
+        result = freeze_longmemeval_holdout(
+            args.dataset,
+            args.output,
+            per_category=args.per_category,
+            exclude_ids=excluded_ids,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 async def _run_transcript_import(args: argparse.Namespace) -> None:
@@ -571,6 +633,8 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
         extraction_concurrency=args.extraction_concurrency,
         retry_failed=args.retry_failed_sessions,
         use_evidence_graph=args.evidence_graph,
+        use_evidence_reasoning=args.evidence_reasoning,
+        use_evidence_abstention=args.evidence_abstention,
     )
     if args.hypotheses:
         write_longmemeval_hypotheses(report, args.hypotheses)

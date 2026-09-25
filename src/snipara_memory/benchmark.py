@@ -177,6 +177,8 @@ async def run_longmemeval_qa(
     extraction_concurrency: int = 1,
     retry_failed: bool = False,
     use_evidence_graph: bool = False,
+    use_evidence_reasoning: bool = False,
+    use_evidence_abstention: bool = False,
 ) -> LongMemEvalQAReport:
     """Run retrieve -> reader -> official judge on a LongMemEval subset."""
 
@@ -193,6 +195,8 @@ async def run_longmemeval_qa(
         extraction_concurrency=extraction_concurrency,
         retry_failed=retry_failed,
         use_evidence_graph=use_evidence_graph,
+        use_evidence_reasoning=use_evidence_reasoning,
+        use_evidence_abstention=use_evidence_abstention,
     )
 
 
@@ -271,6 +275,18 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
         "retrieval_recall_at_k": report.retrieval_recall_at_k,
         "answer_session_recall_evaluable_count": report.answer_session_recall_evaluable_count,
         "answer_session_recall_at_k": report.answer_session_recall_at_k,
+        "graph_enabled": report.graph_enabled,
+        "graph_expansion_calls": report.graph_expansion_calls,
+        "graph_added_match_count": report.graph_added_match_count,
+        "graph_visited_node_count": report.graph_visited_node_count,
+        "graph_explicit_relation_edge_count": report.graph_explicit_relation_edge_count,
+        "graph_active_call_count": report.graph_active_call_count,
+        "reasoning_enabled": report.reasoning_enabled,
+        "reasoning_supported_count": report.reasoning_supported_count,
+        "reasoning_conflicting_count": report.reasoning_conflicting_count,
+        "reasoning_unresolved_count": report.reasoning_unresolved_count,
+        "reasoning_insufficient_count": report.reasoning_insufficient_count,
+        "abstention_enabled": report.abstention_enabled,
         "categories": [
             {
                 "category": category.category,
@@ -311,6 +327,9 @@ def longmemeval_qa_report_as_json(report: LongMemEvalQAReport) -> str:
                 "ingestion_complete": question.ingestion_complete,
                 "failed_stage": question.failed_stage,
                 "failure_message": question.failure_message,
+                "reasoning_status": question.reasoning_status,
+                "reasoning_operation": question.reasoning_operation,
+                "reasoning_value": question.reasoning_value,
             }
             for question in report.questions
         ],
@@ -339,6 +358,15 @@ def render_longmemeval_qa_report(report: LongMemEvalQAReport) -> str:
         f"Accuracy (clean ingestion): {report.clean_accuracy:.3f} ({report.clean_scored_count} judged)",
         f"Answer-session hit rate@{report.retrieval_k}: {report.retrieval_recall_at_k:.3f}",
         f"Answer-session recall@{report.retrieval_k}: {report.answer_session_recall_at_k:.3f}",
+        f"Evidence graph: enabled={report.graph_enabled}; "
+        f"calls={report.graph_expansion_calls}; added={report.graph_added_match_count}; "
+        f"active-calls={report.graph_active_call_count}",
+        f"Deterministic reasoning: enabled={report.reasoning_enabled}; "
+        f"supported={report.reasoning_supported_count}; "
+        f"conflicting={report.reasoning_conflicting_count}; "
+        f"unresolved={report.reasoning_unresolved_count}; "
+        f"insufficient={report.reasoning_insufficient_count}; "
+        f"abstention={report.abstention_enabled}",
         f"Reader cache hits/misses: {report.reader_cache_hits}/{report.reader_cache_misses}",
         f"Judge cache hits/misses: {report.judge_cache_hits}/{report.judge_cache_misses}",
         f"Failed ingestion sessions: {report.ingestion_failed_session_count}",

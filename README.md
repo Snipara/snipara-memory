@@ -233,6 +233,7 @@ matches = graph.expand_matches(
     max_hops=2,
     max_nodes=128,
 )
+print(graph.stats())
 ```
 
 The equivalent service method is opt-in and keeps ordinary semantic recall as
@@ -259,7 +260,16 @@ if result.status.value == "supported":
 LongMemEval can enable the graph expansion explicitly with
 `run_longmemeval_qa(..., use_evidence_graph=True)`. The default remains
 disabled until ablations show a reproducible gain over the existing retrieval
-control.
+control. `--evidence-reasoning` adds only supported deterministic numeric cards;
+`--evidence-abstention` adds an auditable status card when typed evidence is
+conflicting, unresolved, or insufficient. QA cache identities include the
+selected mode so control and candidate runs cannot collide.
+
+For a reproducible benchmark, freeze a disjoint manifest with
+`freeze_longmemeval_holdout(...)` and validate it with
+`validate_longmemeval_holdout(...)`. Keep the existing control manifest in the
+exclusion set, and report single-session, multi-session, numeric, and
+abstention categories separately.
 
 ## Install
 

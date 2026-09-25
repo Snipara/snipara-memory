@@ -33,6 +33,7 @@ from .evidence_graph import (
     AnswerabilityStatus,
     EvidenceEdge,
     EvidenceGraph,
+    EvidenceGraphStats,
     EvidenceNode,
     EvidenceNodeKind,
     EvidencePath,
@@ -58,6 +59,7 @@ from .longmemeval import (
     ingest_longmemeval_question,
     load_longmemeval_instances,
 )
+from .holdout import freeze_longmemeval_holdout, validate_longmemeval_holdout
 from .ports import CacheStore, EmbeddingsProvider, MemoryStore
 from .qa import (
     LONGMEMEVAL_JUDGE_PROMPT_VERSION,
@@ -109,6 +111,7 @@ __all__ = [
     "EmbeddingsProvider",
     "EvidenceEdge",
     "EvidenceGraph",
+    "EvidenceGraphStats",
     "EvidenceNode",
     "EvidenceNodeKind",
     "EvidencePath",
@@ -119,6 +122,7 @@ __all__ = [
     "GraveyardEntry",
     "GraveyardReason",
     "HeuristicFactExtractor",
+    "freeze_longmemeval_holdout",
     "InMemoryMemoryStore",
     "JsonFileMemoryStore",
     "LmStudioBatchFactExtractor",
@@ -162,6 +166,7 @@ __all__ = [
     "ingest_longmemeval_dataset",
     "ingest_longmemeval_question",
     "load_longmemeval_instances",
+    "validate_longmemeval_holdout",
     "official_longmemeval_judge_prompt",
     "provenance_key_for_memory",
     "reason_over_contributions",

@@ -23,14 +23,21 @@ from urllib.request import Request, urlopen
 
 from .adapters import InMemoryMemoryStore
 from .domain import (
+    Memory,
     MemoryService,
+    MemoryType,
     MemoryStatus,
     RecallMatch,
     RecallQuery,
     provenance_key_for_memory,
     select_diverse_matches,
 )
-from .evidence_graph import EvidenceGraph
+from .evidence_graph import (
+    AnswerabilityStatus,
+    EvidenceGraph,
+    extract_numeric_contributions,
+    reason_over_contributions,
+)
 from .longmemeval import (
     ExtractionCache,
     FactExtractor,
@@ -3757,6 +3764,9 @@ class LongMemEvalQAResult:
     failed_stage: str | None = None
     failure_message: str | None = None
     ingestion_failed_session_count: int = 0
+    reasoning_status: str | None = None
+    reasoning_operation: str | None = None
+    reasoning_value: str | None = None
 
     @property
     def ingestion_complete(self) -> bool:
@@ -3831,6 +3841,18 @@ class LongMemEvalQAReport:
     partial_ingestion_count: int
     categories: tuple[LongMemEvalCategoryReport, ...]
     questions: tuple[LongMemEvalQAResult, ...]
+    graph_enabled: bool = False
+    graph_expansion_calls: int = 0
+    graph_added_match_count: int = 0
+    graph_visited_node_count: int = 0
+    graph_explicit_relation_edge_count: int = 0
+    graph_active_call_count: int = 0
+    reasoning_enabled: bool = False
+    reasoning_supported_count: int = 0
+    reasoning_conflicting_count: int = 0
+    reasoning_unresolved_count: int = 0
+    reasoning_insufficient_count: int = 0
+    abstention_enabled: bool = False
 
     @property
     def accuracy(self) -> float:
@@ -3914,12 +3936,15 @@ def _retrieval_input_hash(
     question: LongMemEvalQuestion,
     matches: Sequence[RecallMatch],
     retrieval_k: int,
+    *,
+    mode: str = "control",
 ) -> str:
     payload = {
         "question_id": question.question_id,
         "question": question.question,
         "question_date": question.question_date,
         "retrieval_k": retrieval_k,
+        "mode": mode,
         "memories": [
             {
                 "rank": index,
@@ -3954,6 +3979,130 @@ def _reader_context_limit(question_type: str, retrieval_k: int) -> int:
     return max(retrieval_k, 16)
 
 
+def _numeric_operation_for_question(question: LongMemEvalQuestion) -> str | None:
+    """Infer only broad numeric operations; never infer a benchmark answer."""
+
+    text = question.question.lower()
+    if re.search(
+        r"\b(?:difference|how much more|how much less|increase|decrease|change)\b",
+        text,
+    ):
+        return "difference"
+    if re.search(
+        r"\b(?:total|sum|altogether|combined|in total|how much did .* spend|how much .* paid)\b",
+        text,
+    ):
+        return "sum"
+    if re.search(r"\b(?:how many|number of|count of|how often)\b", text):
+        return "count"
+    return None
+
+
+def _apply_evidence_reasoning(
+    question: LongMemEvalQuestion,
+    matches: Sequence[RecallMatch],
+    *,
+    use_evidence_reasoning: bool,
+    use_evidence_abstention: bool,
+    metrics: dict[str, int],
+) -> tuple[list[RecallMatch], dict[str, str | None]]:
+    """Add one auditable derived card when typed evidence supports an operation."""
+
+    result_info: dict[str, str | None] = {
+        "status": None,
+        "operation": None,
+        "value": None,
+    }
+    if not (use_evidence_reasoning or use_evidence_abstention):
+        return list(matches), result_info
+    operation = _numeric_operation_for_question(question)
+    if operation is None:
+        return list(matches), result_info
+    contributions = extract_numeric_contributions(
+        [match.memory for match in matches],
+        allow_text_parsing=False,
+    )
+    reasoning = reason_over_contributions(operation, contributions)
+    result_info.update(
+        {
+            "status": reasoning.status.value,
+            "operation": operation,
+            "value": str(reasoning.value) if reasoning.value is not None else None,
+        }
+    )
+    metrics_key = {
+        AnswerabilityStatus.SUPPORTED: "reasoning_supported_count",
+        AnswerabilityStatus.CONFLICTING: "reasoning_conflicting_count",
+        AnswerabilityStatus.UNRESOLVED: "reasoning_unresolved_count",
+        AnswerabilityStatus.INSUFFICIENT: "reasoning_insufficient_count",
+    }[reasoning.status]
+    metrics[metrics_key] = metrics.get(metrics_key, 0) + 1
+
+    should_add = reasoning.status is AnswerabilityStatus.SUPPORTED and use_evidence_reasoning
+    should_add = should_add or (
+        use_evidence_abstention
+        and reasoning.status
+        in {
+            AnswerabilityStatus.CONFLICTING,
+            AnswerabilityStatus.UNRESOLVED,
+            AnswerabilityStatus.INSUFFICIENT,
+        }
+    )
+    if not should_add:
+        return list(matches), result_info
+
+    source_ids = tuple(dict.fromkeys(match.memory.id for match in matches))
+    source_sessions = tuple(
+        dict.fromkeys(
+            str(match.memory.metadata.get("source_session_id"))
+            for match in matches
+            if match.memory.metadata.get("source_session_id")
+        )
+    )
+    if reasoning.status is AnswerabilityStatus.SUPPORTED:
+        unit = f" {reasoning.unit}" if reasoning.unit else ""
+        content = (
+            f"Deterministic evidence calculation supported: {operation} = "
+            f"{reasoning.value}{unit}. Derived only from typed contributions."
+        )
+    else:
+        content = (
+            f"Deterministic evidence status: {reasoning.status.value} for "
+            f"{operation}; do not invent or combine an unsupported numeric answer."
+        )
+    digest = hashlib.sha256(
+        f"{question.question_id}:{operation}:{reasoning.status.value}:"
+        f"{','.join(source_ids)}".encode("utf-8")
+    ).hexdigest()[:16]
+    derived = Memory(
+        id=f"derived-reasoning:{digest}",
+        namespace_id="longmemeval-derived",
+        content=content,
+        content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        title="Deterministic evidence reasoning",
+        type=MemoryType.CONTEXT,
+        source="evidence-graph-reasoner",
+        provenance_key="derived:evidence-graph",
+        confidence=1.0 if reasoning.status is AnswerabilityStatus.SUPPORTED else 0.9,
+        metadata={
+            "evidence_kind": "derived_reasoning",
+            "reasoning_status": reasoning.status.value,
+            "reasoning_operation": operation,
+            "derived_from_memory_ids": list(source_ids),
+            "derived_from_sessions": list(source_sessions),
+            "question_id": question.question_id,
+        },
+        document_refs=[f"longmemeval://derived/{question.question_id}"],
+    )
+    metrics["reasoning_card_count"] = metrics.get("reasoning_card_count", 0) + 1
+    derived_match = RecallMatch(
+        memory=derived,
+        score=max((match.score for match in matches), default=0.0) + 0.01,
+        reason="evidence-graph:deterministic-reasoning",
+    )
+    return [derived_match, *matches], result_info
+
+
 async def run_longmemeval_qa(
     dataset_path: str | Path,
     extractor: FactExtractor,
@@ -3968,6 +4117,8 @@ async def run_longmemeval_qa(
     extraction_concurrency: int = 1,
     retry_failed: bool = False,
     use_evidence_graph: bool = False,
+    use_evidence_reasoning: bool = False,
+    use_evidence_abstention: bool = False,
 ) -> LongMemEvalQAReport:
     """Run LongMemEval ingestion, retrieval, reader generation, and judging."""
 
@@ -3992,6 +4143,8 @@ async def run_longmemeval_qa(
     judge_cache_hits = 0
     judge_cache_misses = 0
     ingestion_failed_session_count = 0
+    graph_metrics: dict[str, int] = {}
+    reasoning_metrics: dict[str, int] = {}
 
     for question in questions:
         category = _question_category(question)
@@ -4013,6 +4166,7 @@ async def run_longmemeval_qa(
                 namespace_id=ingestion.namespace_id,
                 limit=retrieval_k,
                 use_evidence_graph=use_evidence_graph,
+                graph_metrics=graph_metrics,
             )
             reader_matches = await _retrieve_longmemeval_matches(
                 service,
@@ -4020,6 +4174,14 @@ async def run_longmemeval_qa(
                 namespace_id=ingestion.namespace_id,
                 limit=_reader_context_limit(question.question_type, retrieval_k),
                 use_evidence_graph=use_evidence_graph,
+                graph_metrics=graph_metrics,
+            )
+            reader_matches, reasoning_info = _apply_evidence_reasoning(
+                question,
+                reader_matches,
+                use_evidence_reasoning=use_evidence_reasoning,
+                use_evidence_abstention=use_evidence_abstention,
+                metrics=reasoning_metrics,
             )
         except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
             results.append(
@@ -4058,7 +4220,28 @@ async def run_longmemeval_qa(
             if answer_session_ids
             else None
         )
-        input_hash = _retrieval_input_hash(question, reader_matches, retrieval_k)
+        input_hash = _retrieval_input_hash(
+            question,
+            reader_matches,
+            retrieval_k,
+            mode=(
+                "graph+reasoning+abstention"
+                if use_evidence_graph and use_evidence_reasoning and use_evidence_abstention
+                else "graph+reasoning"
+                if use_evidence_graph and use_evidence_reasoning
+                else "graph+abstention"
+                if use_evidence_graph and use_evidence_abstention
+                else "reasoning+abstention"
+                if use_evidence_reasoning and use_evidence_abstention
+                else "graph"
+                if use_evidence_graph
+                else "reasoning"
+                if use_evidence_reasoning
+                else "abstention"
+                if use_evidence_abstention
+                else "control"
+            ),
+        )
         reader_response: str | None = None
         if qa_cache:
             reader_response = qa_cache.get_reader(
@@ -4095,6 +4278,9 @@ async def run_longmemeval_qa(
                         ingestion_failed_session_count=len(
                             ingestion.failed_session_ids
                         ),
+                        reasoning_status=reasoning_info.get("status"),
+                        reasoning_operation=reasoning_info.get("operation"),
+                        reasoning_value=reasoning_info.get("value"),
                     )
                 )
                 if qa_cache:
@@ -4152,6 +4338,9 @@ async def run_longmemeval_qa(
                         ingestion_failed_session_count=len(
                             ingestion.failed_session_ids
                         ),
+                        reasoning_status=reasoning_info.get("status"),
+                        reasoning_operation=reasoning_info.get("operation"),
+                        reasoning_value=reasoning_info.get("value"),
                     )
                 )
                 if qa_cache:
@@ -4187,6 +4376,9 @@ async def run_longmemeval_qa(
                     "partial-ingestion" if ingestion.failed_session_ids else "scored"
                 ),
                 ingestion_failed_session_count=len(ingestion.failed_session_ids),
+                reasoning_status=reasoning_info.get("status"),
+                reasoning_operation=reasoning_info.get("operation"),
+                reasoning_value=reasoning_info.get("value"),
             )
         )
 
@@ -4233,6 +4425,28 @@ async def run_longmemeval_qa(
         ),
         categories=tuple(categories),
         questions=tuple(results),
+        graph_enabled=use_evidence_graph,
+        graph_expansion_calls=graph_metrics.get("expansion_calls", 0),
+        graph_added_match_count=graph_metrics.get("added_match_count", 0),
+        graph_visited_node_count=graph_metrics.get("visited_node_count", 0),
+        graph_explicit_relation_edge_count=graph_metrics.get(
+            "explicit_relation_edge_count", 0
+        ),
+        graph_active_call_count=graph_metrics.get("active_call_count", 0),
+        reasoning_enabled=use_evidence_reasoning,
+        reasoning_supported_count=reasoning_metrics.get(
+            "reasoning_supported_count", 0
+        ),
+        reasoning_conflicting_count=reasoning_metrics.get(
+            "reasoning_conflicting_count", 0
+        ),
+        reasoning_unresolved_count=reasoning_metrics.get(
+            "reasoning_unresolved_count", 0
+        ),
+        reasoning_insufficient_count=reasoning_metrics.get(
+            "reasoning_insufficient_count", 0
+        ),
+        abstention_enabled=use_evidence_abstention,
     )
 
 
@@ -5225,6 +5439,7 @@ async def _retrieve_longmemeval_matches(
     namespace_id: str,
     limit: int,
     use_evidence_graph: bool = False,
+    graph_metrics: dict[str, int] | None = None,
 ) -> list[RecallMatch]:
     """Retrieve a broad candidate pool, rerank evidence, then diversify sessions."""
 
@@ -5350,13 +5565,27 @@ async def _retrieve_longmemeval_matches(
     )
     if use_evidence_graph and reranked:
         graph = EvidenceGraph.from_memories(memories)
+        graph_stats = graph.stats()
+        if graph_metrics is not None:
+            graph_metrics["node_count"] = graph_metrics.get("node_count", 0) + graph_stats.node_count
+            graph_metrics["edge_count"] = graph_metrics.get("edge_count", 0) + graph_stats.edge_count
+            graph_metrics["explicit_relation_edge_count"] = graph_metrics.get(
+                "explicit_relation_edge_count", 0
+            ) + graph_stats.explicit_relation_edge_count
+        graph_seed_limit = min(len(reranked), max(32, limit * 4))
+        graph_seeds = reranked[:graph_seed_limit]
         expanded = graph.expand_matches(
-            reranked,
+            graph_seeds,
             limit=min(candidate_limit, len(memories)),
             max_hops=2,
             max_nodes=min(256, max(candidate_limit, 64)),
             pivot_width=16,
+            metrics=graph_metrics,
         )
+        seed_ids = {match.memory.id for match in graph_seeds}
+        expanded_added = [
+            match for match in expanded if match.memory.id not in seed_ids
+        ]
         merged = {match.memory.id: match for match in reranked}
         for match in expanded:
             previous = merged.get(match.memory.id)
@@ -5371,6 +5600,10 @@ async def _retrieve_longmemeval_matches(
             ),
             reverse=True,
         )
+        if graph_metrics is not None and expanded_added:
+            graph_metrics["active_call_count"] = graph_metrics.get(
+                "active_call_count", 0
+            ) + 1
     source_limit = (
         min(2, limit)
         if question.question_type == "single-session-assistant"

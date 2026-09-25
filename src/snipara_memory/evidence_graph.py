@@ -74,6 +74,17 @@ class EvidencePath:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceGraphStats:
+    """Bounded graph shape metrics used to prove whether traversal was active."""
+
+    node_count: int
+    edge_count: int
+    memory_node_count: int
+    entity_node_count: int
+    explicit_relation_edge_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class NumericContribution:
     """One typed numeric contribution with an auditable source."""
 
@@ -198,6 +209,31 @@ class EvidenceGraph:
             self.edges.append(edge)
             self._edge_keys.add(key)
         return edge
+
+    def stats(self) -> EvidenceGraphStats:
+        """Return cheap, storage-neutral graph activation counters."""
+
+        explicit_relations = {
+            EvidenceRelation.CONTRADICTS,
+            EvidenceRelation.CONTRIBUTES_TO,
+            EvidenceRelation.MENTIONS,
+            EvidenceRelation.SAME_AS,
+            EvidenceRelation.SUPERSEDES,
+        }
+        return EvidenceGraphStats(
+            node_count=len(self.nodes),
+            edge_count=len(self.edges),
+            memory_node_count=sum(
+                node.kind in {EvidenceNodeKind.FACT, EvidenceNodeKind.EVENT}
+                for node in self.nodes.values()
+            ),
+            entity_node_count=sum(
+                node.kind is EvidenceNodeKind.ENTITY for node in self.nodes.values()
+            ),
+            explicit_relation_edge_count=sum(
+                edge.relation in explicit_relations for edge in self.edges
+            ),
+        )
 
     @classmethod
     def from_memories(cls, memories: Sequence[Memory]) -> EvidenceGraph:
@@ -457,6 +493,7 @@ class EvidenceGraph:
         max_nodes: int = 128,
         pivot_width: int = 16,
         hop_decay: float = 0.72,
+        metrics: dict[str, int] | None = None,
     ) -> list[RecallMatch]:
         """Expand only a bounded frontier around hybrid-retrieval seeds.
 
@@ -466,6 +503,9 @@ class EvidenceGraph:
         reader.
         """
 
+        if metrics is not None:
+            metrics["expansion_calls"] = metrics.get("expansion_calls", 0) + 1
+            metrics["seed_count"] = metrics.get("seed_count", 0) + len(seeds)
         if limit <= 0 or max_hops < 0 or max_nodes <= 0 or pivot_width <= 0:
             return []
         adjacency: dict[str, list[tuple[str, EvidenceEdge]]] = defaultdict(list)
@@ -604,11 +644,22 @@ class EvidenceGraph:
                     score=score,
                     reason=reason,
                 )
-        return sorted(
+        ordered = sorted(
             selected.values(),
             key=lambda match: (match.score, match.memory.confidence, match.memory.id),
             reverse=True,
         )[:limit]
+        if metrics is not None:
+            metrics["visited_node_count"] = (
+                metrics.get("visited_node_count", 0) + expanded_nodes
+            )
+            metrics["returned_match_count"] = (
+                metrics.get("returned_match_count", 0) + len(ordered)
+            )
+            metrics["added_match_count"] = metrics.get("added_match_count", 0) + sum(
+                match.memory.id not in seed_scores for match in ordered
+            )
+        return ordered
 
 
 def _metadata_ints(value: Any) -> tuple[int, ...]:

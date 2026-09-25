@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from snipara_memory import (
     extract_numeric_contributions,
     reason_over_contributions,
 )
+from snipara_memory.qa import _apply_evidence_reasoning
 
 
 def _memory(
@@ -99,17 +101,25 @@ def test_graph_expansion_reaches_related_fact_through_bounded_pivot() -> None:
     )
 
     graph = EvidenceGraph.from_memories([seed, related, unrelated])
+    stats = graph.stats()
+    metrics: dict[str, int] = {}
     matches = graph.expand_matches(
         [RecallMatch(memory=seed, score=1.0)],
         limit=5,
         max_hops=2,
         max_nodes=8,
         pivot_width=1,
+        metrics=metrics,
     )
 
     ids = {match.memory.id for match in matches}
     assert {"m1", "m2"}.issubset(ids)
     assert "m3" not in ids
+    assert stats.entity_node_count == 3
+    assert stats.explicit_relation_edge_count >= 5
+    assert metrics["expansion_calls"] == 1
+    assert metrics["added_match_count"] >= 1
+    assert metrics["visited_node_count"] > 0
     assert any(
         match.memory.id == "m2"
         and match.reason is not None
@@ -226,6 +236,48 @@ def test_numeric_reasoning_flags_conflicting_repeated_contribution() -> None:
     assert result.status is AnswerabilityStatus.CONFLICTING
     assert result.value is None
     assert result.reason == "conflicting_values_for_same_contribution"
+
+
+def test_qa_reasoning_adds_only_a_provenance_linked_supported_card() -> None:
+    memories = [
+        _memory(
+            "m1",
+            "The user paid $12.50 for the train.",
+            session="s1",
+            turn=0,
+            metadata={"quantitative_values": ["12.50"], "unit": "USD"},
+        ),
+        _memory(
+            "m2",
+            "The user paid $7.50 for lunch.",
+            session="s2",
+            turn=0,
+            metadata={"quantitative_values": ["7.50"], "unit": "USD"},
+        ),
+    ]
+    question = SimpleNamespace(
+        question_id="q-total",
+        question="How much did the user pay in total?",
+        question_type="multi-session",
+    )
+    metrics: dict[str, int] = {}
+    matches, info = _apply_evidence_reasoning(
+        question,
+        [RecallMatch(memory=memory, score=1.0) for memory in memories],
+        use_evidence_reasoning=True,
+        use_evidence_abstention=False,
+        metrics=metrics,
+    )
+
+    assert info == {
+        "status": "supported",
+        "operation": "sum",
+        "value": "20.00",
+    }
+    assert matches[0].memory.metadata["evidence_kind"] == "derived_reasoning"
+    assert matches[0].memory.metadata["derived_from_memory_ids"] == ["m1", "m2"]
+    assert "20.00 USD" in matches[0].memory.content
+    assert metrics["reasoning_supported_count"] == 1
 
 
 @pytest.mark.asyncio

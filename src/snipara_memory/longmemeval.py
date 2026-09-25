@@ -39,7 +39,7 @@ from .importers import (
 LONGMEMEVAL_CACHE_SCHEMA = "snipara.longmemeval.extraction-cache.v1"
 LONGMEMEVAL_SOURCE = "longmemeval-cleaned"
 LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
-LM_STUDIO_DEFAULT_PROMPT_VERSION = "lmstudio-fact-extractor-v4"
+LM_STUDIO_DEFAULT_PROMPT_VERSION = "lmstudio-fact-extractor-v5"
 LM_STUDIO_SYSTEM_PROMPT = """You build a compact evidence index for one timestamped chat session.
 
 Extract facts and answer-bearing evidence that can help answer a future
@@ -94,6 +94,12 @@ answer-bearing entity, optionally emit entity_keys as short canonical labels.
 Only link entities when the conversation supports the identity; leave the list
 empty when the reference is ambiguous.
 
+For a fact containing a quantity that can be counted, summed, or compared,
+emit quantitative_values with the exact scalar strings, and emit unit,
+contribution_id, and operation_scope only when the transcript supports them.
+Use the same contribution_id for repeated observations of the same named
+quantity so the reasoner can detect conflicts instead of adding them.
+
 Extract at most 12 high-value facts. Keep each content and title under 220
 characters, use at most 6 tags per fact, and return compact JSON only.
 """
@@ -117,6 +123,7 @@ LM_STUDIO_FACT_SCHEMA: dict[str, Any] = {
                     "supersedes_fact_key",
                     "source_turn_indices",
                     "tags",
+                    "entity_keys",
                 ],
                 "properties": {
                     "content": {"type": "string", "minLength": 1},
@@ -164,6 +171,14 @@ LM_STUDIO_FACT_SCHEMA: dict[str, Any] = {
                     "temporal_anchor": {
                         "anyOf": [{"type": "string"}, {"type": "null"}]
                     },
+                    "quantitative_values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8,
+                    },
+                    "unit": {"type": "string"},
+                    "contribution_id": {"type": "string"},
+                    "operation_scope": {"type": "string"},
                 },
             },
         }
@@ -1614,7 +1629,14 @@ def _normalize_lm_studio_fact(fact: object) -> Mapping[str, Any]:
         metadata = {}
     else:
         metadata = dict(metadata)
-    for key in ("evidence_kind", "temporal_anchor"):
+    for key in (
+        "evidence_kind",
+        "temporal_anchor",
+        "quantitative_values",
+        "unit",
+        "contribution_id",
+        "operation_scope",
+    ):
         if key in normalized:
             metadata[key] = normalized[key]
     normalized["metadata"] = metadata
