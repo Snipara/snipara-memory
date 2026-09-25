@@ -89,6 +89,11 @@ date, time, or relative-order phrase stated in the conversation; otherwise use
 null. The session_date is the fallback date for an event discussed as happening
 in that session, not proof of an unrelated date.
 
+When a fact names a stable person, place, product, project, event, or other
+answer-bearing entity, optionally emit entity_keys as short canonical labels.
+Only link entities when the conversation supports the identity; leave the list
+empty when the reference is ambiguous.
+
 Extract at most 12 high-value facts. Keep each content and title under 220
 characters, use at most 6 tags per fact, and return compact JSON only.
 """
@@ -139,6 +144,11 @@ LM_STUDIO_FACT_SCHEMA: dict[str, Any] = {
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
+                    },
+                    "entity_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8,
                     },
                     "evidence_kind": {
                         "type": "string",
@@ -334,6 +344,7 @@ class ExtractedFact:
     supersedes_fact_key: str | None = None
     source_turn_indices: tuple[int, ...] = ()
     tags: tuple[str, ...] = ()
+    entity_keys: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -351,6 +362,7 @@ class ExtractedFact:
             "source_turn_indices", payload.get("turn_indices", [])
         )
         raw_tags = payload.get("tags", [])
+        raw_entity_keys = payload.get("entity_keys", [])
         return cls(
             content=str(payload["content"]),
             title=str(payload["title"]) if payload.get("title") is not None else None,
@@ -366,6 +378,7 @@ class ExtractedFact:
             ),
             source_turn_indices=tuple(int(value) for value in raw_indices),
             tags=tuple(str(value) for value in raw_tags),
+            entity_keys=tuple(str(value) for value in raw_entity_keys),
             metadata=dict(payload.get("metadata", {})),
         )
 
@@ -379,6 +392,7 @@ class ExtractedFact:
             "supersedes_fact_key": self.supersedes_fact_key,
             "source_turn_indices": list(self.source_turn_indices),
             "tags": list(self.tags),
+            "entity_keys": list(self.entity_keys),
             "metadata": dict(self.metadata),
         }
 
@@ -2087,6 +2101,7 @@ async def ingest_longmemeval_question(
                     "extractor_version": extractor_version,
                     "fact_key": fact.fact_key,
                     "supersedes_fact_key": fact.supersedes_fact_key,
+                    "entity_keys": list(fact.entity_keys),
                     "answer_session": session.session_id in question.answer_session_ids,
                 }
             )

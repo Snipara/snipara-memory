@@ -205,6 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of memories passed to the reader",
     )
     longmemeval_qa.add_argument(
+        "--evidence-graph",
+        action="store_true",
+        help="Enable bounded evidence-graph expansion for retrieval ablations",
+    )
+    longmemeval_qa.add_argument(
         "--extractor",
         choices=("heuristic", "lm-studio"),
         default="lm-studio",
@@ -565,6 +570,7 @@ async def _run_longmemeval_qa(args: argparse.Namespace) -> None:
         question_ids=selected_question_ids,
         extraction_concurrency=args.extraction_concurrency,
         retry_failed=args.retry_failed_sessions,
+        use_evidence_graph=args.evidence_graph,
     )
     if args.hypotheses:
         write_longmemeval_hypotheses(report, args.hypotheses)

@@ -211,6 +211,56 @@ These are generic memory primitives. A benchmark adapter may add query
 expansion, official prompts, or category-specific readers, but the lifecycle
 and evidence selection remain reusable by project-memory clients.
 
+## Evidence graph (opt-in)
+
+The package also includes a storage-neutral evidence graph. It is built from
+active memories, keeps source/session/turn provenance, accepts only explicit
+entity links, and supports supersession plus bounded pivot expansion. It does
+not require Neo4j: `to_rows()` returns relational node and edge rows suitable
+for a PostgreSQL adapter.
+
+```python
+from snipara_memory import EvidenceGraph, RecallMatch
+
+memories = await service.list_memories("demo")
+graph = EvidenceGraph.from_memories(memories)
+semantic_matches = await service.semantic_recall(
+    RecallQuery(namespace_id="demo", query="deployment target", limit=4)
+)
+matches = graph.expand_matches(
+    [semantic_matches[0]],
+    limit=12,
+    max_hops=2,
+    max_nodes=128,
+)
+```
+
+The equivalent service method is opt-in and keeps ordinary semantic recall as
+the control path:
+
+```python
+matches = await service.graph_recall(
+    RecallQuery(namespace_id="demo", query="deployment target", limit=8)
+)
+```
+
+Numeric contributions can be evaluated without asking the reader model to
+choose or calculate unsupported values:
+
+```python
+from snipara_memory import extract_numeric_contributions, reason_over_contributions
+
+contributions = extract_numeric_contributions(memories)
+result = reason_over_contributions("sum", contributions)
+if result.status.value == "supported":
+    print(result.value, result.unit, result.as_dict()["contributions"])
+```
+
+LongMemEval can enable the graph expansion explicitly with
+`run_longmemeval_qa(..., use_evidence_graph=True)`. The default remains
+disabled until ablations show a reproducible gain over the existing retrieval
+control.
+
 ## Install
 
 ```bash

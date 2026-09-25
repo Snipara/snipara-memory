@@ -9,6 +9,10 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from ..evidence_graph import EvidenceGraph
+from ..ports.cache import CacheStore
+from ..ports.embeddings import EmbeddingsProvider
+from ..ports.store import MemoryStore
 from .models import (
     CompactionResult,
     Contradiction,
@@ -27,9 +31,6 @@ from .models import (
     SessionMemoryBundle,
     StoreMemoryRequest,
 )
-from ..ports.cache import CacheStore
-from ..ports.embeddings import EmbeddingsProvider
-from ..ports.store import MemoryStore
 
 CONFIDENCE_DECAY_RATE = 0.01
 MIN_CONFIDENCE = 0.1
@@ -467,6 +468,39 @@ class MemoryService:
             tiers=tiers,
             types=types,
             limit=limit,
+        )
+
+    async def graph_recall(
+        self,
+        query: RecallQuery,
+        *,
+        seeds: Sequence[RecallMatch] | None = None,
+        max_hops: int = 2,
+        max_nodes: int = 128,
+        pivot_width: int = 16,
+    ) -> list[RecallMatch]:
+        """Expand hybrid-retrieval seeds through a bounded evidence graph.
+
+        This is opt-in and keeps the existing ``semantic_recall`` contract as
+        the control path.  The backing store remains authoritative; the graph
+        is rebuilt from active memories and can later be projected to
+        PostgreSQL without changing the traversal API.
+        """
+
+        seed_matches = list(seeds or await self.semantic_recall(query))
+        if not seed_matches:
+            return []
+        memories = await self._store.list_memories(
+            query.namespace_id,
+            statuses=[MemoryStatus.ACTIVE],
+        )
+        graph = EvidenceGraph.from_memories(memories)
+        return graph.expand_matches(
+            seed_matches,
+            limit=query.limit,
+            max_hops=max_hops,
+            max_nodes=max_nodes,
+            pivot_width=pivot_width,
         )
 
     async def get_session_memories(

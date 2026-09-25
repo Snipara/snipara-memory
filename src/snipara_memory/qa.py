@@ -30,6 +30,7 @@ from .domain import (
     provenance_key_for_memory,
     select_diverse_matches,
 )
+from .evidence_graph import EvidenceGraph
 from .longmemeval import (
     ExtractionCache,
     FactExtractor,
@@ -3966,6 +3967,7 @@ async def run_longmemeval_qa(
     question_ids: set[str] | None = None,
     extraction_concurrency: int = 1,
     retry_failed: bool = False,
+    use_evidence_graph: bool = False,
 ) -> LongMemEvalQAReport:
     """Run LongMemEval ingestion, retrieval, reader generation, and judging."""
 
@@ -4010,12 +4012,14 @@ async def run_longmemeval_qa(
                 question,
                 namespace_id=ingestion.namespace_id,
                 limit=retrieval_k,
+                use_evidence_graph=use_evidence_graph,
             )
             reader_matches = await _retrieve_longmemeval_matches(
                 service,
                 question,
                 namespace_id=ingestion.namespace_id,
                 limit=_reader_context_limit(question.question_type, retrieval_k),
+                use_evidence_graph=use_evidence_graph,
             )
         except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
             results.append(
@@ -5220,6 +5224,7 @@ async def _retrieve_longmemeval_matches(
     *,
     namespace_id: str,
     limit: int,
+    use_evidence_graph: bool = False,
 ) -> list[RecallMatch]:
     """Retrieve a broad candidate pool, rerank evidence, then diversify sessions."""
 
@@ -5343,6 +5348,29 @@ async def _retrieve_longmemeval_matches(
         ),
         reverse=True,
     )
+    if use_evidence_graph and reranked:
+        graph = EvidenceGraph.from_memories(memories)
+        expanded = graph.expand_matches(
+            reranked,
+            limit=min(candidate_limit, len(memories)),
+            max_hops=2,
+            max_nodes=min(256, max(candidate_limit, 64)),
+            pivot_width=16,
+        )
+        merged = {match.memory.id: match for match in reranked}
+        for match in expanded:
+            previous = merged.get(match.memory.id)
+            if previous is None or match.score > previous.score:
+                merged[match.memory.id] = match
+        reranked = sorted(
+            merged.values(),
+            key=lambda match: (
+                match.score,
+                match.memory.confidence,
+                match.memory.metadata.get("source_session_date") or "",
+            ),
+            reverse=True,
+        )
     source_limit = (
         min(2, limit)
         if question.question_type == "single-session-assistant"
