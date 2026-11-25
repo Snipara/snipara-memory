@@ -22,7 +22,7 @@ python -m pytest
 Run the local API:
 
 ```bash
-python -m snipara_memory --host 127.0.0.1 --port 8000
+snipara-memory serve --host 127.0.0.1 --port 8000
 ```
 
 Run the examples:
