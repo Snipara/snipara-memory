@@ -408,7 +408,7 @@ See [docs/mcp.md](docs/mcp.md).
 
 ## What Is Included
 
-Version `0.1.x` includes:
+Version `0.2.x` includes:
 
 - standalone domain models
 - memory service

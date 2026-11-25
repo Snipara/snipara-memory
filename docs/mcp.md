@@ -15,6 +15,11 @@ Use an explicit store file if you want a repo-local memory corpus:
 snipara-memory mcp --store-path ./.snipara-memory.json
 ```
 
+The server runs on version 2 of the MCP Python SDK. It answers MCP 2026-07-28
+clients as well as the handshake versions up to 2025-11-25. An environment that
+also needs `mcp<2` keeps `snipara-memory` 0.1.7. Next to it, `snipara-sandbox`
+must be 3.6.0 or later and `snipara-mcp` 5.0.0 or later.
+
 ## Exposed Tools
 
 - `memory_store`

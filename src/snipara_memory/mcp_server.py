@@ -9,10 +9,19 @@ from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any
 
-from mcp.server import Server
+import jsonschema
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+)
 
+from . import __version__
 from .adapters import InMemoryMemoryStore, JsonFileMemoryStore, get_default_store_path
 from .domain import (
     ContradictionResolution,
@@ -44,15 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def create_server(service: MemoryService) -> Server:
-    server = Server("snipara-memory")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
+    def list_tools() -> list[Tool]:
         return [
             Tool(
                 name="memory_store",
                 description="Store a durable memory in a namespace.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -81,7 +87,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_recall",
                 description="Recall memories semantically from a namespace.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -122,7 +128,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_session_bundle",
                 description="Load the tiered session memory bundle for a namespace.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -136,7 +142,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_list",
                 description="List memories in a namespace with optional filters.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -151,7 +157,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_detect_contradictions",
                 description="Detect semantically overlapping memories that may need resolution.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -163,7 +169,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_resolve_contradiction",
                 description="Resolve a contradiction by choosing a winner or merging content.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "contradiction_id": {"type": "string"},
@@ -182,7 +188,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_import_transcript",
                 description="Import durable memories from a local transcript file.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -200,7 +206,7 @@ def create_server(service: MemoryService) -> Server:
             Tool(
                 name="memory_import_project",
                 description="Import durable memory candidates from local project docs.",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "namespace_id": {"type": "string"},
@@ -212,7 +218,6 @@ def create_server(service: MemoryService) -> Server:
             ),
         ]
 
-    @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if name == "memory_store":
             memory = await service.store_memory(
@@ -370,7 +375,34 @@ def create_server(service: MemoryService) -> Server:
 
         raise ValueError(f"Unknown tool: {name}")
 
-    return server
+    tools = list_tools()
+    input_schemas = {tool.name: tool.input_schema for tool in tools}
+
+    async def on_list_tools(
+        _ctx: ServerRequestContext, _params: PaginatedRequestParams | None
+    ) -> ListToolsResult:
+        return ListToolsResult(tools=tools)
+
+    async def on_call_tool(
+        _ctx: ServerRequestContext, params: CallToolRequestParams
+    ) -> CallToolResult:
+        """Report invalid arguments and tool failures, which the SDK does not do."""
+        arguments = params.arguments or {}
+        try:
+            jsonschema.validate(arguments, input_schemas.get(params.name, {}))
+        except jsonschema.ValidationError as error:
+            return _error_result(f"Input validation error: {error.message}")
+        try:
+            return CallToolResult(content=await call_tool(params.name, arguments))
+        except Exception as error:
+            return _error_result(str(error))
+
+    return Server(
+        "snipara-memory",
+        version=__version__,
+        on_list_tools=on_list_tools,
+        on_call_tool=on_call_tool,
+    )
 
 
 async def run_stdio_server(
@@ -392,6 +424,10 @@ async def run_stdio_server(
             write_stream,
             server.create_initialization_options(),
         )
+
+
+def _error_result(text: str) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
 
 
 def _json_result(payload: Any) -> TextContent:
